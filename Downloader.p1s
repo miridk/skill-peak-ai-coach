@@ -1,0 +1,7 @@
+
+
+python -m yt_dlp -F "https://www.youtube.com/watch?v=ScbQz2EMnR0"
+
+python -m yt_dlp -f "bv*+ba/b" --merge-output-format mp4 "https://www.youtube.com/watch?v=GSBFqmqYlYI"
+
+python -m yt_dlp -f "bv*[height>=1080]+ba/b[height>=1080]" --merge-output-format mp4 "https://www.youtube.com/watch?v=ScbQz2EMnR0"

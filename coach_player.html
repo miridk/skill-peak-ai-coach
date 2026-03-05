@@ -1,0 +1,688 @@
+<!doctype html>
+<html lang="da">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Badminton AI Coach Player</title>
+    <style>
+      :root {
+        --bg: #ffffff;
+        --text: #111111;
+        --muted: #6b7280;
+        --card: #ffffff;
+        --border: #e5e7eb;
+        --shadow: 0 8px 28px rgba(0, 0, 0, 0.07);
+
+        --red: #e11d48; /* rose/red */
+        --redSoft: rgba(225, 29, 72, 0.12);
+        --redBorder: rgba(225, 29, 72, 0.28);
+
+        --btn: #ffffff;
+        --btnBorder: #d1d5db;
+        --btnHover: #f9fafb;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family:
+          system-ui,
+          -apple-system,
+          Segoe UI,
+          Roboto,
+          Arial;
+        background: var(--bg);
+        color: var(--text);
+      }
+
+      .wrap {
+        display: flex;
+        gap: 14px;
+        padding: 14px;
+        height: 100vh;
+      }
+
+      .left {
+        width: 360px;
+        max-width: 44vw;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .right {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        min-width: 320px;
+      }
+
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 12px;
+        box-shadow: var(--shadow);
+      }
+
+      .title {
+        font-size: 16px;
+        font-weight: 750;
+        margin: 0 0 6px 0;
+        letter-spacing: 0.2px;
+      }
+
+      .muted {
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.35;
+      }
+
+      .row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        border: 1px solid var(--border);
+        background: #fff;
+        color: var(--muted);
+      }
+
+      .pill strong {
+        color: var(--text);
+        font-weight: 700;
+      }
+
+      .badge {
+        color: var(--red);
+        font-weight: 800;
+      }
+
+      .videoCard {
+        background: #000;
+        border-radius: 14px;
+        overflow: hidden;
+        border: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      video {
+        width: 100%;
+        height: auto;
+        max-height: calc(100vh - 170px);
+        background: #000;
+      }
+
+      .controls {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+
+      .controls input[type="range"] {
+        width: 320px;
+        max-width: 60vw;
+      }
+
+      .small {
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      /* Buttons */
+      button {
+        background: var(--btn);
+        color: var(--text);
+        border: 1px solid var(--btnBorder);
+        border-radius: 10px;
+        padding: 10px 12px;
+        cursor: pointer;
+        font-weight: 700;
+      }
+      button:hover {
+        background: var(--btnHover);
+      }
+
+      button.primary {
+        border-color: var(--redBorder);
+        background: var(--redSoft);
+      }
+      button.primary:hover {
+        background: rgba(225, 29, 72, 0.16);
+      }
+
+      button.subtle {
+        border-color: var(--border);
+        background: #fff;
+        color: var(--muted);
+        font-weight: 700;
+      }
+
+      button.danger {
+        border-color: rgba(225, 29, 72, 0.4);
+        color: var(--red);
+        background: #fff;
+      }
+
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+
+      /* Coach panel */
+      .coachBox {
+        border: 1px solid var(--redBorder);
+        background: rgba(225, 29, 72, 0.06);
+        border-radius: 14px;
+        padding: 12px;
+      }
+
+      ul {
+        margin: 8px 0 0 18px;
+        padding: 0;
+      }
+      li {
+        margin: 6px 0;
+        color: var(--text);
+      }
+
+      .evidence {
+        font-variant-numeric: tabular-nums;
+        font-size: 12px;
+        color: var(--muted);
+        margin-top: 10px;
+      }
+
+      .hidden {
+        display: none;
+      }
+
+      input[type="text"],
+      input[type="number"] {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 8px 10px;
+        outline: none;
+        background: #fff;
+        color: var(--text);
+      }
+      input[type="text"]:focus,
+      input[type="number"]:focus {
+        border-color: var(--redBorder);
+        box-shadow: 0 0 0 3px rgba(225, 29, 72, 0.1);
+      }
+
+      @media (max-width: 920px) {
+        .wrap {
+          flex-direction: column;
+          height: auto;
+        }
+        .left {
+          width: 100%;
+          max-width: none;
+        }
+        video {
+          max-height: 56vh;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <div class="wrap">
+      <!-- LEFT -->
+      <div class="left">
+        <div class="card">
+          <div class="row" style="justify-content: space-between">
+            <div class="pill">
+              Status: <span id="status" class="badge">Klar</span>
+            </div>
+            <div class="pill">Player: <strong id="playerId">All</strong></div>
+          </div>
+
+          <div style="height: 10px"></div>
+
+          <div id="coachEmpty">
+            <div class="title">Ingen tip lige nu</div>
+            <div class="muted">
+              Videoen pauser automatisk ved interessepunkter, og du får en kort
+              coach-note her.
+            </div>
+          </div>
+
+          <div id="coachPanel" class="hidden">
+            <div class="coachBox">
+              <div
+                class="row"
+                style="justify-content: space-between; align-items: flex-start"
+              >
+                <div>
+                  <div class="title" id="coachTitle">—</div>
+                  <div class="muted" id="coachBody">—</div>
+                </div>
+                <div class="pill">
+                  #<strong><span id="eventIndex">0</span></strong
+                  >/<span id="eventCount">0</span>
+                </div>
+              </div>
+
+              <ul id="coachSteps"></ul>
+              <div class="evidence" id="coachEvidence"></div>
+
+              <div class="row" style="margin-top: 10px; gap: 8px">
+                <button class="subtle" id="btnReplay">↺ Replay 2s</button>
+                <button class="primary" id="btnContinue">▶ Fortsæt</button>
+                <button class="subtle" id="btnUnderstood">✓ Forstået</button>
+                <button class="subtle" id="btnNext">⏭ Næste tip</button>
+                <button class="danger" id="btnIgnore">Ignorér</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="title">Indstillinger</div>
+          <div class="row" style="margin-top: 8px">
+            <label class="pill">
+              Auto-pause:
+              <input
+                id="autoPause"
+                type="checkbox"
+                checked
+                style="margin-left: 8px"
+              />
+            </label>
+
+            <label class="pill">
+              Replay sek:
+              <input
+                id="replaySec"
+                type="number"
+                min="0"
+                max="8"
+                step="0.5"
+                value="2"
+                style="width: 72px; margin-left: 8px"
+              />
+            </label>
+
+            <label class="pill">
+              Pause offset:
+              <input
+                id="pauseOffset"
+                type="number"
+                min="0"
+                max="2"
+                step="0.05"
+                value="0.35"
+                style="width: 84px; margin-left: 8px"
+              />
+            </label>
+          </div>
+
+          <div class="small" style="margin-top: 10px">
+            Tip: Start med få events (5–10) så oplevelsen føles “coach-agtig” og
+            ikke afbrydende.
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT -->
+      <div class="right">
+        <div class="card">
+          <div class="row" style="justify-content: space-between">
+            <div>
+              <div class="title" style="margin: 0">Video</div>
+              <div class="small">
+                Auto-pauser ved events og viser coach-boks til venstre.
+              </div>
+            </div>
+            <div class="row">
+              <label class="pill">
+                Video:
+                <input
+                  id="videoFile"
+                  type="text"
+                  value="save/input_tracked_20260302_214125_h264.mp4"
+                  style="margin-left: 8px; width: 240px"
+                />
+              </label>
+              <button class="subtle" id="btnLoadVideo">Indlæs</button>
+            </div>
+          </div>
+
+          <div style="height: 12px"></div>
+          <div class="videoCard">
+            <video id="video" controls preload="metadata"></video>
+          </div>
+
+          <div style="height: 12px"></div>
+          <div class="controls">
+            <button class="primary" id="btnPlayPause">▶/⏸</button>
+            <span class="small"
+              >Tid: <span id="timeNow">0.00</span>s /
+              <span id="timeDur">0.00</span>s</span
+            >
+            <input id="seek" type="range" min="0" max="1000" value="0" />
+
+            <label class="pill">
+              Events JSON:
+              <input
+                id="eventsFile"
+                type="text"
+                value="metrics_out/events/events_all.json"
+                style="margin-left: 8px; width: 320px"
+              />
+            </label>
+            <button class="subtle" id="btnLoadEvents">Indlæs</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      const video = $("video");
+      const statusEl = $("status");
+
+      const coachEmpty = $("coachEmpty");
+      const coachPanel = $("coachPanel");
+      const coachTitle = $("coachTitle");
+      const coachBody = $("coachBody");
+      const coachSteps = $("coachSteps");
+      const coachEvidence = $("coachEvidence");
+      const eventIndexEl = $("eventIndex");
+      const eventCountEl = $("eventCount");
+
+      const autoPauseEl = $("autoPause");
+      const replaySecEl = $("replaySec");
+      const pauseOffsetEl = $("pauseOffset");
+
+      const seek = $("seek");
+      const timeNow = $("timeNow");
+      const timeDur = $("timeDur");
+
+      let events = [];
+      let nextEventIdx = 0;
+      let activeEvent = null;
+      let understood = new Set();
+      let ignored = new Set();
+
+      let coachTimer = null;
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      function formatEvidence(ev) {
+        if (!ev) return "";
+        const keys = Object.keys(ev);
+        if (!keys.length) return "";
+        return (
+          "Evidence: " +
+          keys
+            .map(
+              (k) =>
+                `${k}=${typeof ev[k] === "number" ? ev[k].toFixed(2) : ev[k]}`,
+            )
+            .join(" · ")
+        );
+      }
+
+      function showCoach(eventObj) {
+        activeEvent = eventObj;
+        coachTitle.textContent = eventObj.title || eventObj.type || "Tip";
+        coachBody.textContent = eventObj.body || "";
+        coachEvidence.textContent = formatEvidence(eventObj.evidence);
+
+        coachSteps.innerHTML = "";
+        (eventObj.fix_steps || []).forEach((s) => {
+          const li = document.createElement("li");
+          li.textContent = s;
+          coachSteps.appendChild(li);
+        });
+
+        coachEmpty.classList.add("hidden");
+        coachPanel.classList.remove("hidden");
+
+        eventCountEl.textContent = String(events.length);
+        eventIndexEl.textContent = String(
+          Math.min(nextEventIdx, events.length),
+        );
+      }
+
+      function hideCoach() {
+        activeEvent = null;
+        coachPanel.classList.add("hidden");
+        coachEmpty.classList.remove("hidden");
+      }
+
+      function sortAndResetEvents(list) {
+        const raw = list || [];
+        if (!raw.length) {
+          events = [];
+          nextEventIdx = 0;
+          hideCoach();
+          eventCountEl.textContent = "0";
+          eventIndexEl.textContent = "0";
+          console.warn("No events in JSON.");
+          return;
+        }
+
+        const firstTe = Number(raw[0].t_event);
+        const looksLikeMs = Number.isFinite(firstTe) && firstTe > 1000;
+
+        events = raw
+          .map((e) => {
+            const te = Number(e.t_event);
+            const tp = e.t_pause == null ? null : Number(e.t_pause);
+            return {
+              ...e,
+              t_event: looksLikeMs ? te / 1000 : te,
+              t_pause: tp == null ? null : looksLikeMs ? tp / 1000 : tp,
+              severity: e.severity == null ? null : Number(e.severity),
+            };
+          })
+          .filter((e) => Number.isFinite(e.t_event))
+          .sort((a, b) => a.t_event - b.t_event);
+
+        nextEventIdx = 0;
+        hideCoach();
+
+        eventCountEl.textContent = String(events.length);
+        eventIndexEl.textContent = "0";
+
+        console.log(
+          "Loaded events:",
+          events.length,
+          "msMode=",
+          looksLikeMs,
+          "first=",
+          events[0],
+        );
+      }
+
+      function maybeTriggerEvent(currentTime) {
+        if (!autoPauseEl.checked) return;
+
+        while (nextEventIdx < events.length) {
+          const e = events[nextEventIdx];
+
+          const tEvent = Number(e.t_event);
+          const tPause =
+            e.t_pause != null && Number.isFinite(Number(e.t_pause))
+              ? Number(e.t_pause)
+              : tEvent + Number(pauseOffsetEl.value || 0.35);
+
+          const key = `${e.player_id ?? "all"}@${tEvent}`;
+          if (ignored.has(key) || understood.has(key)) {
+            nextEventIdx++;
+            continue;
+          }
+
+          if (tPause < currentTime - 0.15) {
+            nextEventIdx++;
+            continue;
+          }
+
+          if (currentTime >= tPause - 0.05) {
+            video.pause();
+            showCoach({ ...e, t_event: tEvent, t_pause: tPause });
+            nextEventIdx++;
+            setStatus("PAUSE");
+          }
+          return;
+        }
+      }
+
+      function startCoachLoop() {
+        if (coachTimer) clearInterval(coachTimer);
+        coachTimer = setInterval(() => {
+          if (!events.length) return;
+          if (!autoPauseEl.checked) return;
+          if (video.paused) return;
+          maybeTriggerEvent(video.currentTime || 0);
+        }, 100);
+      }
+
+      video.addEventListener("play", startCoachLoop);
+      video.addEventListener("pause", () => {
+        if (coachTimer) clearInterval(coachTimer);
+        coachTimer = null;
+      });
+
+      // Actions
+      $("btnReplay").onclick = () => {
+        if (!activeEvent) return;
+        const replaySec = Number(replaySecEl.value || 2);
+        const t = Math.max(0, (activeEvent.t_event || 0) - replaySec);
+        video.currentTime = t;
+        video.play();
+        setStatus("REPLAY");
+      };
+
+      $("btnContinue").onclick = () => {
+        video.play();
+        setStatus("PLAY");
+      };
+
+      $("btnUnderstood").onclick = () => {
+        if (!activeEvent) return;
+        const key = `${activeEvent.player_id ?? "all"}@${activeEvent.t_event}`;
+        understood.add(key);
+        hideCoach();
+        video.play();
+        setStatus("PLAY");
+      };
+
+      $("btnIgnore").onclick = () => {
+        if (!activeEvent) return;
+        const key = `${activeEvent.player_id ?? "all"}@${activeEvent.t_event}`;
+        ignored.add(key);
+        hideCoach();
+        video.play();
+        setStatus("PLAY");
+      };
+
+      $("btnNext").onclick = () => {
+        if (!events.length) return;
+        if (nextEventIdx >= events.length) return;
+        const e = events[nextEventIdx];
+        const tJump = Math.max(0, Number(e.t_event || 0) - 1.0);
+        video.currentTime = tJump;
+        video.play();
+        setStatus("NEXT");
+      };
+
+      $("btnPlayPause").onclick = () => {
+        if (video.paused) {
+          video.play();
+          setStatus("PLAY");
+        } else {
+          video.pause();
+          setStatus("PAUSE");
+        }
+      };
+
+      function loadVideoFromInput() {
+        const file = $("videoFile").value.trim();
+        video.src = file;
+        video.load();
+        setStatus("VIDEO");
+      }
+      $("btnLoadVideo").onclick = loadVideoFromInput;
+
+      async function loadEvents() {
+        const path = $("eventsFile").value.trim();
+        setStatus("LOADING…");
+        try {
+          const res = await fetch(path, { cache: "no-store" });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+
+          const list = Array.isArray(data) ? data : data.events || [];
+          sortAndResetEvents(list);
+          setStatus(`EVENTS (${events.length})`);
+
+          if (!video.paused) startCoachLoop();
+        } catch (err) {
+          console.error(err);
+          setStatus("EVENTS ERROR");
+          alert(
+            "Kunne ikke indlæse events. Kør via server: python -m http.server 8000",
+          );
+        }
+      }
+      $("btnLoadEvents").onclick = loadEvents;
+
+      // UI sync
+      video.addEventListener("loadedmetadata", () => {
+        timeDur.textContent = (video.duration || 0).toFixed(2);
+        seek.value = 0;
+      });
+
+      video.addEventListener("timeupdate", () => {
+        const t = video.currentTime || 0;
+        timeNow.textContent = t.toFixed(2);
+        if (video.duration && isFinite(video.duration)) {
+          seek.value = Math.floor((t / video.duration) * 1000);
+        }
+      });
+
+      seek.addEventListener("input", () => {
+        if (!video.duration || !isFinite(video.duration)) return;
+        const t = (Number(seek.value) / 1000) * video.duration;
+        video.currentTime = t;
+        setStatus("SEEK");
+        nextEventIdx = 0;
+        hideCoach();
+      });
+
+      // init
+      loadVideoFromInput();
+      setStatus("Klar");
+    </script>
+
+    <!--
+      KØR LOKALT:
+      python -m http.server 8000
+      Åbn: http://localhost:8000/coach_player.html
+    -->
+  </body>
+</html>
