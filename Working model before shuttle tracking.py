@@ -42,7 +42,8 @@ COURT_DST = np.array(
 )
 
 # Detection
-COURT_MARGIN_PX = 75
+COURT_MARGIN_PX = 75          # behold denne som "top margin"
+SIDE_BOTTOM_MARGIN_PX = 5    # venstre, højre og bund
 CONF = 0.45
 IOU = 0.6
 IMGSZ = 960
@@ -56,25 +57,45 @@ CLIP_MODEL_NAME = "ViT-B-32"
 CLIP_PRETRAINED = "laion2b_s34b_b79k"
 CLIP_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-MAX_AGE_SECONDS = 2.5
-MAX_MATCH_DIST_M = 3.0
+MAX_AGE_SECONDS = 3.0
+MAX_MATCH_DIST_M = 3.2
 
 # Assignment weights
-W_CLIP = 0.55
-W_MOTION = 0.20
-W_COLOR = 0.15
-W_SIZE = 0.10
+W_CLIP = 0.58
+W_MOTION = 0.16
+W_COLOR = 0.10
+W_SIZE = 0.05
+W_SIDE = 0.11
+W_EDGE = 0.10
 
 # Anti-switch
-SWITCH_MARGIN = 0.08
-SWITCH_CONFIRM_FRAMES = 5
-UNMATCHED_COST = 0.95
+SWITCH_MARGIN = 0.14
+SWITCH_CONFIRM_FRAMES = 8
+UNMATCHED_COST = 1.15
 
-# Embedding smoothing
-CLIP_EMA_ALPHA = 0.18
-COLOR_EMA_ALPHA = 0.18
+# Outsider rejection
+MAX_ACCEPT_COST = 0.72
+OUTSIDER_DIST_M = 1.75
+OUTSIDER_CLIP_MIN_SIM = 0.58
+
+# Embedding smoothing / memory
+CLIP_EMA_ALPHA = 0.14
+COLOR_EMA_ALPHA = 0.16
 VEL_ALPHA = 0.40
 SIZE_ALPHA = 0.25
+MEMORY_BANK_SIZE = 12
+MEMORY_MATCH_TOPK = 4
+
+# Occlusion handling
+OCCLUSION_IOU_THRESH = 0.18
+OCCLUSION_EXTRA_STICKINESS = 0.16
+OCCLUSION_MOTION_BOOST = 0.08
+OCCLUSION_CLIP_REDUCE = 0.10
+OCCLUSION_FREEZE_BANK_UPDATE = True
+
+# Side plausibility
+SIDE_PENALTY = 0.22
+SIDE_GRACE_FRAMES = 20
 
 # Live stats overlay settings
 SPEED_SMOOTH_ALPHA = 0.35
@@ -148,6 +169,76 @@ def make_export_paths(export_dir: str, input_path: str) -> tuple[str, str]:
 
 def point_in_polygon_margin(pt, poly, margin_px=35) -> bool:
     return cv2.pointPolygonTest(poly, pt, True) >= -margin_px
+
+
+def point_to_polygon_signed_distance(pt, poly) -> float:
+    return float(cv2.pointPolygonTest(poly, pt, True))
+
+
+def point_in_court_asymmetric_margin(
+    pt: Tuple[float, float],
+    court_pts: np.ndarray,
+    top_margin: float,
+    side_bottom_margin: float,
+) -> bool:
+    """
+    Safer asymmetric margin:
+    - true inside polygon
+    - small margin on left/right/bottom using polygon signed distance
+    - larger margin only above the top edge
+    """
+    x, y = float(pt[0]), float(pt[1])
+    poly = court_pts.reshape(-1, 2).astype(np.float32)
+
+    # Order expected: TL, TR, BR, BL
+    tl, tr, br, bl = poly
+
+    # 1) strictly inside polygon
+    if cv2.pointPolygonTest(court_pts, (x, y), False) >= 0:
+        return True
+
+    # 2) small generic margin, but NOT above the top edge
+    signed_dist = float(cv2.pointPolygonTest(court_pts, (x, y), True))
+
+    top_y_min = min(float(tl[1]), float(tr[1]))
+
+    # allow small margin only if point is not above the top edge area
+    if y >= top_y_min and signed_dist >= -side_bottom_margin:
+        return True
+
+    # 3) special larger allowance only near the top edge
+    x1, y1 = float(tl[0]), float(tl[1])
+    x2, y2 = float(tr[0]), float(tr[1])
+
+    dx = x2 - x1
+    dy = y2 - y1
+    seg_len2 = dx * dx + dy * dy
+    if seg_len2 <= 1e-6:
+        return False
+
+    # projection onto top segment
+    t = ((x - x1) * dx + (y - y1) * dy) / seg_len2
+
+    # allow a little horizontal slack near the ends
+    slack = side_bottom_margin / max(1.0, math.sqrt(seg_len2))
+    if t < -slack or t > 1.0 + slack:
+        return False
+
+    t_clamped = max(0.0, min(1.0, t))
+    proj_x = x1 + t_clamped * dx
+    proj_y = y1 + t_clamped * dy
+
+    # perpendicular distance to top edge
+    perp_dist = math.hypot(x - proj_x, y - proj_y)
+
+    # only allow points ABOVE the top edge
+    line_y_at_x = proj_y
+    is_above_top = y < line_y_at_x
+
+    if is_above_top and perp_dist <= top_margin:
+        return True
+
+    return False
 
 
 def px_to_meters(H: np.ndarray, x_px: float, y_px: float) -> tuple[float, float]:
@@ -244,6 +335,49 @@ def classify_zone(x_m: float, y_m: float) -> str:
     depth = "FRONT" if dist_to_net <= 1.98 else "BACK"
     lr = "LEFT" if x_m < COURT_W / 2.0 else "RIGHT"
     return f"{side_group}-{depth}-{lr}"
+
+
+def bbox_iou_xyxy(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+
+    if union <= 1e-8:
+        return 0.0
+    return float(inter / union)
+
+
+def side_from_y(y_m: float) -> str:
+    return "FAR" if y_m < (COURT_L / 2.0) else "NEAR"
+
+
+def best_bank_similarity(bank: List[np.ndarray], feat: Optional[np.ndarray], topk: int = 4) -> float:
+    if feat is None or not bank:
+        return 0.0
+
+    sims = []
+    for b in bank:
+        s = cosine_sim(b, feat)
+        sims.append(clamp01((s + 1.0) * 0.5))
+
+    if not sims:
+        return 0.0
+
+    sims.sort(reverse=True)
+    sims = sims[:max(1, topk)]
+    return float(sum(sims) / len(sims))
 
 
 # ----------------------------
@@ -479,40 +613,7 @@ def player_click_callback(event, x, y, flags, param):
         clicked_player_points.append([x, y])
         print(f"Player click: ({x}, {y}) -> {len(clicked_player_points)}")
 
-# this should be used for single matches
-def click_two_players(frame0: np.ndarray) -> list[list[int]]:
-    global clicked_player_points
-    clicked_player_points = []
-    clone = frame0.copy()
 
-    cv2.namedWindow("Click player 1 and 2", cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback("Click player 1 and 2", player_click_callback)
-
-    while True:
-        vis = clone.copy()
-        for i, p in enumerate(clicked_player_points):
-            cv2.circle(vis, tuple(p), 9, (0, 255, 0), -1)
-            cv2.putText(vis, f"P{i+1}", (p[0] + 12, p[1] - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2, cv2.LINE_AA)
-
-        cv2.putText(vis, "Click PLAYER 1 then PLAYER 2 | R=reset | ESC/Q=quit",
-                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-
-        cv2.imshow("Click player 1 and 2", vis)
-        key = cv2.waitKey(10) & 0xFF
-
-        if key in (27, ord("q"), ord("Q")):
-            cv2.destroyAllWindows()
-            raise SystemExit("User quit during player init.")
-        if key in (ord("r"), ord("R")):
-            clicked_player_points = []
-        if len(clicked_player_points) == 2:
-            break
-
-    cv2.destroyWindow("Click player 1 and 2")
-    return clicked_player_points
-
-# this should be used for double matches
 def click_players(frame0: np.ndarray, num_players: int = 4) -> list[list[int]]:
     global clicked_player_points
     clicked_player_points = []
@@ -621,6 +722,9 @@ class IdentityTrack:
     clip_feat: Optional[np.ndarray]
     color_feat: Optional[np.ndarray]
 
+    clip_bank: List[np.ndarray]
+    color_bank: List[np.ndarray]
+
     box_h: float
     box_w: float
 
@@ -629,6 +733,9 @@ class IdentityTrack:
 
     pending_raw_tid: Optional[int] = None
     pending_count: int = 0
+
+    preferred_side: Optional[str] = None
+    side_stable_frames: int = 0
 
 
 class IdentityManager:
@@ -661,6 +768,16 @@ class IdentityManager:
 
             used.add(best_i)
             det = detections[best_i]
+
+            clip_bank: List[np.ndarray] = []
+            color_bank: List[np.ndarray] = []
+            if det.get("clip_feat") is not None:
+                clip_bank.append(det["clip_feat"])
+            if det.get("color_feat") is not None:
+                color_bank.append(det["color_feat"])
+
+            pref_side = side_from_y(float(det["y_m"]))
+
             self.tracks[sid] = IdentityTrack(
                 stable_id=sid,
                 last_x=float(det["x_m"]),
@@ -670,10 +787,14 @@ class IdentityManager:
                 last_seen_frame=int(det["frame_idx"]),
                 clip_feat=det.get("clip_feat"),
                 color_feat=det.get("color_feat"),
+                clip_bank=clip_bank,
+                color_bank=color_bank,
                 box_h=float(det.get("box_h", 0.0)),
                 box_w=float(det.get("box_w", 0.0)),
                 raw_tracker_id=int(det["track_id"]) if det.get("track_id") is not None else None,
                 hits=1,
+                preferred_side=pref_side,
+                side_stable_frames=1,
             )
             det["stable_id"] = sid
             det["side_group"] = "ALL"
@@ -684,21 +805,46 @@ class IdentityManager:
         py = tr.last_y + tr.vy * dtf
         return px, py
 
-    def _motion_cost(self, tr: IdentityTrack, det: dict, frame_idx: int) -> float:
+    def _motion_cost(self, tr: IdentityTrack, det: dict, frame_idx: int, occluded: bool) -> float:
         px, py = self._predict_xy(tr, frame_idx)
         d = math.hypot(float(det["x_m"]) - px, float(det["y_m"]) - py)
-        return clamp01(d / max(1e-6, self.max_match_dist_m))
+        base = clamp01(d / max(1e-6, self.max_match_dist_m))
+        if occluded:
+            base = max(0.0, base - OCCLUSION_MOTION_BOOST)
+        return base
 
-    def _clip_cost(self, tr: IdentityTrack, det: dict) -> float:
-        sim = cosine_sim(tr.clip_feat, det.get("clip_feat"))
-        if tr.clip_feat is None or det.get("clip_feat") is None:
+    def _clip_cost(self, tr: IdentityTrack, det: dict, occluded: bool) -> float:
+        feat = det.get("clip_feat")
+        sim_bank = best_bank_similarity(tr.clip_bank, feat, topk=MEMORY_MATCH_TOPK)
+
+        sim_ema = 0.0
+        if tr.clip_feat is not None and feat is not None:
+            sim_ema = clamp01((cosine_sim(tr.clip_feat, feat) + 1.0) * 0.5)
+
+        if feat is None:
             return 0.45
-        sim01 = clamp01((sim + 1.0) * 0.5)
-        return 1.0 - sim01
+
+        sim = max(sim_bank, sim_ema)
+        cost = 1.0 - sim
+
+        if occluded:
+            cost = min(1.0, cost + OCCLUSION_CLIP_REDUCE)
+
+        return cost
 
     def _color_cost(self, tr: IdentityTrack, det: dict) -> float:
-        sim = safe_hist_corr(tr.color_feat, det.get("color_feat"))
-        if tr.color_feat is None or det.get("color_feat") is None:
+        feat = det.get("color_feat")
+        sim_bank = 0.0
+        if feat is not None and tr.color_bank:
+            sims = [safe_hist_corr(b, feat) for b in tr.color_bank]
+            sims.sort(reverse=True)
+            sims = sims[:max(1, min(4, len(sims)))]
+            sim_bank = float(sum(sims) / len(sims))
+
+        sim_ema = safe_hist_corr(tr.color_feat, feat) if feat is not None else 0.0
+        sim = max(sim_bank, sim_ema)
+
+        if feat is None:
             return 0.35
         return 1.0 - sim
 
@@ -718,15 +864,62 @@ class IdentityManager:
 
         return 0.65 * ch + 0.35 * cw
 
-    def _total_cost(self, tr: IdentityTrack, det: dict, frame_idx: int) -> float:
+    def _side_cost(self, tr: IdentityTrack, det: dict) -> float:
+        if tr.preferred_side is None:
+            return 0.0
+
+        current_side = side_from_y(float(det["y_m"]))
+
+        if current_side == tr.preferred_side:
+            return 0.0
+
+        if tr.side_stable_frames < SIDE_GRACE_FRAMES:
+            return SIDE_PENALTY
+        return SIDE_PENALTY * 0.55
+
+    def _edge_cost(self, det: dict) -> float:
+        d = float(det.get("foot_poly_dist", 0.0))
+        if d >= 15:
+            return 0.0
+        if d <= -20:
+            return 1.0
+        return clamp01((15.0 - d) / 35.0)
+
+    def _total_cost(self, tr: IdentityTrack, det: dict, frame_idx: int, occluded: bool) -> float:
         return (
-            W_CLIP * self._clip_cost(tr, det)
-            + W_MOTION * self._motion_cost(tr, det, frame_idx)
+            W_CLIP * self._clip_cost(tr, det, occluded)
+            + W_MOTION * self._motion_cost(tr, det, frame_idx, occluded)
             + W_COLOR * self._color_cost(tr, det)
             + W_SIZE * self._size_cost(tr, det)
+            + W_SIDE * self._side_cost(tr, det)
+            + W_EDGE * self._edge_cost(det)
         )
 
-    def _update_track(self, sid: int, det: dict, frame_idx: int) -> None:
+    def _push_bank(self, bank: List[np.ndarray], feat: Optional[np.ndarray], max_size: int) -> List[np.ndarray]:
+        if feat is None:
+            return bank
+        bank.append(feat.astype(np.float32))
+        if len(bank) > max_size:
+            bank = bank[-max_size:]
+        return bank
+
+    def _update_side_memory(self, tr: IdentityTrack, det: dict):
+        current_side = side_from_y(float(det["y_m"]))
+        if tr.preferred_side is None:
+            tr.preferred_side = current_side
+            tr.side_stable_frames = 1
+            return
+
+        if current_side == tr.preferred_side:
+            tr.side_stable_frames += 1
+        else:
+            if tr.side_stable_frames > SIDE_GRACE_FRAMES:
+                tr.preferred_side = current_side
+                tr.side_stable_frames = 1
+            else:
+                tr.side_stable_frames = max(0, tr.side_stable_frames - 1)
+
+    def _update_track(self, sid: int, det: dict, frame_idx: int, occluded: bool) -> None:
         tr = self.tracks[sid]
 
         dtf = max(1, frame_idx - tr.last_seen_frame)
@@ -743,19 +936,25 @@ class IdentityManager:
         new_clip = det.get("clip_feat")
         if new_clip is not None:
             if tr.clip_feat is None:
-                tr.clip_feat = new_clip
+                tr.clip_feat = new_clip.astype(np.float32)
             else:
                 tr.clip_feat = (CLIP_EMA_ALPHA * new_clip + (1.0 - CLIP_EMA_ALPHA) * tr.clip_feat).astype(np.float32)
                 n = float(np.linalg.norm(tr.clip_feat))
                 if n > 1e-8:
                     tr.clip_feat = (tr.clip_feat / n).astype(np.float32)
 
+            if not (occluded and OCCLUSION_FREEZE_BANK_UPDATE):
+                tr.clip_bank = self._push_bank(tr.clip_bank, new_clip, MEMORY_BANK_SIZE)
+
         new_color = det.get("color_feat")
         if new_color is not None:
             if tr.color_feat is None:
-                tr.color_feat = new_color
+                tr.color_feat = new_color.astype(np.float32)
             else:
                 tr.color_feat = (COLOR_EMA_ALPHA * new_color + (1.0 - COLOR_EMA_ALPHA) * tr.color_feat).astype(np.float32)
+
+            if not (occluded and OCCLUSION_FREEZE_BANK_UPDATE):
+                tr.color_bank = self._push_bank(tr.color_bank, new_color, MEMORY_BANK_SIZE)
 
         tr.box_h = SIZE_ALPHA * float(det.get("box_h", tr.box_h)) + (1.0 - SIZE_ALPHA) * tr.box_h
         tr.box_w = SIZE_ALPHA * float(det.get("box_w", tr.box_w)) + (1.0 - SIZE_ALPHA) * tr.box_w
@@ -765,10 +964,35 @@ class IdentityManager:
             tr.raw_tracker_id = int(raw_tid)
 
         tr.hits += 1
+        self._update_side_memory(tr, det)
+
+    def _compute_occlusion_flags(self, detections: List[dict]) -> List[bool]:
+        flags = [False] * len(detections)
+        for i in range(len(detections)):
+            box_i = (
+                float(detections[i]["bbox_x1"]),
+                float(detections[i]["bbox_y1"]),
+                float(detections[i]["bbox_x2"]),
+                float(detections[i]["bbox_y2"]),
+            )
+            for j in range(i + 1, len(detections)):
+                box_j = (
+                    float(detections[j]["bbox_x1"]),
+                    float(detections[j]["bbox_y1"]),
+                    float(detections[j]["bbox_x2"]),
+                    float(detections[j]["bbox_y2"]),
+                )
+                iou = bbox_iou_xyxy(box_i, box_j)
+                if iou >= OCCLUSION_IOU_THRESH:
+                    flags[i] = True
+                    flags[j] = True
+        return flags
 
     def assign(self, frame_idx: int, detections: List[dict]) -> None:
         if not detections or not self.is_bootstrapped():
             return
+
+        occlusion_flags = self._compute_occlusion_flags(detections)
 
         track_ids = self.stable_ids
         num_tracks = len(track_ids)
@@ -779,24 +1003,46 @@ class IdentityManager:
         for r, sid in enumerate(track_ids):
             tr = self.tracks[sid]
             for c, det in enumerate(detections):
-                cost_matrix[r, c] = self._total_cost(tr, det, frame_idx)
+                occluded = occlusion_flags[c]
+                cost_matrix[r, c] = self._total_cost(tr, det, frame_idx, occluded)
+
+                raw_tid = det.get("track_id")
+                if tr.raw_tracker_id is not None and raw_tid is not None and int(raw_tid) == int(tr.raw_tracker_id):
+                    stickiness = OCCLUSION_EXTRA_STICKINESS if occluded else 0.08
+                    cost_matrix[r, c] = max(0.0, cost_matrix[r, c] - stickiness)
 
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
         proposed: Dict[int, int] = {}
         for r, c in zip(row_ind, col_ind):
             sid = track_ids[r]
-            if cost_matrix[r, c] < UNMATCHED_COST:
-                proposed[sid] = c
+            tr = self.tracks[sid]
+            det = detections[c]
+            occluded = occlusion_flags[c]
 
-        assigned_dets = set()
+            total_cost = float(cost_matrix[r, c])
+
+            motion_cost = self._motion_cost(tr, det, frame_idx, occluded)
+            clip_cost = self._clip_cost(tr, det, occluded)
+
+            clip_sim = 1.0 - clip_cost
+            motion_dist_ok = motion_cost <= clamp01(OUTSIDER_DIST_M / max(1e-6, self.max_match_dist_m))
+
+            strong_identity = clip_sim >= OUTSIDER_CLIP_MIN_SIM
+            acceptable_total = total_cost <= MAX_ACCEPT_COST
+
+            if acceptable_total and (motion_dist_ok or strong_identity):
+                proposed[sid] = c
 
         for sid, det_idx in proposed.items():
             tr = self.tracks[sid]
             det = detections[det_idx]
-            assigned_cost = float(cost_matrix[track_ids.index(sid), det_idx])
+            occluded = occlusion_flags[det_idx]
 
-            row_costs = cost_matrix[track_ids.index(sid)]
+            row_ix = track_ids.index(sid)
+            assigned_cost = float(cost_matrix[row_ix, det_idx])
+
+            row_costs = cost_matrix[row_ix]
             others = [float(v) for j, v in enumerate(row_costs) if j != det_idx]
             second_best_cost = min(others) if others else None
 
@@ -808,9 +1054,12 @@ class IdentityManager:
             )
 
             accept = True
+            local_switch_margin = SWITCH_MARGIN + (OCCLUSION_EXTRA_STICKINESS if occluded else 0.0)
+            local_confirm = SWITCH_CONFIRM_FRAMES + (2 if occluded else 0)
+
             if not same_raw and second_best_cost is not None:
                 improvement = second_best_cost - assigned_cost
-                if improvement >= SWITCH_MARGIN:
+                if improvement >= local_switch_margin:
                     candidate = int(raw_tid) if raw_tid is not None else -1
                     if tr.pending_raw_tid == candidate:
                         tr.pending_count += 1
@@ -818,7 +1067,7 @@ class IdentityManager:
                         tr.pending_raw_tid = candidate
                         tr.pending_count = 1
 
-                    if tr.pending_count < SWITCH_CONFIRM_FRAMES:
+                    if tr.pending_count < local_confirm:
                         accept = False
                     else:
                         tr.pending_raw_tid = None
@@ -833,10 +1082,7 @@ class IdentityManager:
             if accept:
                 det["stable_id"] = sid
                 det["side_group"] = "ALL"
-                assigned_dets.add(det_idx)
-                self._update_track(sid, det, frame_idx)
-
-        # detections not accepted remain stable_id = -1
+                self._update_track(sid, det, frame_idx, occluded)
 
 
 # ----------------------------
@@ -1106,6 +1352,7 @@ def main():
     print(f"   size={width}x{height}, fps={fps:.2f}")
     print(f"   YOLO params: conf={CONF}, iou={IOU}, imgsz={IMGSZ}")
     print(f"   CLIP: {CLIP_MODEL_NAME} / {CLIP_PRETRAINED}")
+    print(f"   Court margin: top={COURT_MARGIN_PX}px, left/right/bottom={SIDE_BOTTOM_MARGIN_PX}px")
     print(f"   Ready: knee<= {READY_KNEE_ANGLE_MAX:.0f}, hip_drop>= {READY_HIP_DROP_MIN:.2f}, speed<= {READY_MAX_SPEED_KMH:.1f} km/h")
 
     cv2.namedWindow("Badminton tracking", cv2.WINDOW_NORMAL)
@@ -1136,11 +1383,16 @@ def main():
                     keep = []
                     for xyxy in detections.xyxy:
                         x1, y1, x2, y2 = xyxy
-                        foot = (int((x1 + x2) / 2), int(y2))
-                        midpt = (int((x1 + x2) / 2), int((y1 + y2) / 2))
-                        inside = point_in_polygon_margin(foot, court_poly_px, margin_px=COURT_MARGIN_PX) or \
-                                 point_in_polygon_margin(midpt, court_poly_px, margin_px=COURT_MARGIN_PX)
+                        foot = (float((x1 + x2) / 2), float(y2))
+
+                        inside = point_in_court_asymmetric_margin(
+                            foot,
+                            court_poly_px,
+                            top_margin=COURT_MARGIN_PX,
+                            side_bottom_margin=SIDE_BOTTOM_MARGIN_PX,
+                        )
                         keep.append(inside)
+
                     detections = detections[np.array(keep, dtype=bool)]
 
                 detections = tracker.update_with_detections(detections)
@@ -1161,6 +1413,7 @@ def main():
                         zone = classify_zone(x_m, y_m)
                         box_w = float(max(1.0, x2 - x1))
                         box_h = float(max(1.0, y2 - y1))
+                        foot_poly_dist = point_to_polygon_signed_distance((float(foot_px_x), float(foot_px_y)), court_poly_px)
 
                         crop = crop_person(frame, (x1, y1, x2, y2), frac=0.04)
                         color_feat = extract_color_feature(frame, (x1, y1, x2, y2))
@@ -1172,6 +1425,7 @@ def main():
                             "bbox_x1": float(x1), "bbox_y1": float(y1),
                             "bbox_x2": float(x2), "bbox_y2": float(y2),
                             "foot_px_x": float(foot_px_x), "foot_px_y": float(foot_px_y),
+                            "foot_poly_dist": float(foot_poly_dist),
                             "x_m": x_m, "y_m": y_m,
                             "zone": zone,
                             "box_w": box_w,
@@ -1195,7 +1449,6 @@ def main():
                     else:
                         identity.assign(frame_idx, det_rows)
 
-                    # keep only assigned player detections
                     det_rows = [r for r in det_rows if int(r.get("stable_id", -1)) in PLAYER_IDS]
 
                     xyxy_by_track = {int(tid): xy for xy, tid in zip(detections.xyxy, detections.tracker_id)}
@@ -1276,6 +1529,7 @@ def main():
                         row_out.pop("color_feat", None)
                         row_out.pop("box_w", None)
                         row_out.pop("box_h", None)
+                        row_out.pop("foot_poly_dist", None)
 
                         row_out.setdefault("stable_id", -1)
                         row_out.setdefault("side_group", "ALL")
@@ -1299,13 +1553,18 @@ def main():
 
             cv2.putText(
                 annotated,
-                f"CLIP identity | conf={CONF} iou={IOU} imgsz={IMGSZ}",
+                f"CLIP identity + outsider gate | conf={CONF} iou={IOU} imgsz={IMGSZ}",
                 (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA,
             )
             cv2.putText(
                 annotated,
-                f"Ready: knee<={READY_KNEE_ANGLE_MAX:.0f} hip>={READY_HIP_DROP_MIN:.2f} speed<={READY_MAX_SPEED_KMH:.1f}",
+                f"Margins top={COURT_MARGIN_PX}px sides/bottom={SIDE_BOTTOM_MARGIN_PX}px",
                 (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA,
+            )
+            cv2.putText(
+                annotated,
+                f"Ready: knee<={READY_KNEE_ANGLE_MAX:.0f} hip>={READY_HIP_DROP_MIN:.2f} speed<={READY_MAX_SPEED_KMH:.1f}",
+                (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA,
             )
 
             cv2.imshow("Badminton tracking", annotated)
