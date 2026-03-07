@@ -42,13 +42,13 @@ COURT_DST = np.array(
 )
 
 # Detection
-COURT_MARGIN_PX = 75          # behold denne som "top margin"
-SIDE_BOTTOM_MARGIN_PX = 5    # venstre, højre og bund
+COURT_MARGIN_PX = 75          # top margin
+SIDE_BOTTOM_MARGIN_PX = 25    # left, right and bottom margin
 CONF = 0.45
 IOU = 0.6
 IMGSZ = 960
 
-# Only 4 logical players for double
+# Logical players for doubles
 PLAYER_IDS = [1, 2, 3, 4]
 MAX_PLAYERS = 4
 
@@ -96,6 +96,15 @@ OCCLUSION_FREEZE_BANK_UPDATE = True
 # Side plausibility
 SIDE_PENALTY = 0.22
 SIDE_GRACE_FRAMES = 20
+
+# Line ambiguity / same-row handling
+AMBIGUOUS_X_PX = 95
+AMBIGUOUS_Y_PX = 240
+AMBIGUOUS_IOU_THRESH = 0.05
+AMBIGUOUS_EXTRA_SWITCH_MARGIN = 0.18
+AMBIGUOUS_EXTRA_CONFIRM_FRAMES = 4
+AMBIGUOUS_FREEZE_BANK_UPDATE = True
+AMBIGUOUS_MAX_ACCEPT_COST = 0.60
 
 # Live stats overlay settings
 SPEED_SMOOTH_ALPHA = 0.35
@@ -919,7 +928,47 @@ class IdentityManager:
             else:
                 tr.side_stable_frames = max(0, tr.side_stable_frames - 1)
 
-    def _update_track(self, sid: int, det: dict, frame_idx: int, occluded: bool) -> None:
+    def _compute_ambiguity_flags(self, detections: List[dict]) -> List[bool]:
+        """
+        Marks detections that are visually ambiguous because multiple players
+        are almost on the same camera line.
+        """
+        flags = [False] * len(detections)
+
+        for i in range(len(detections)):
+            xi = float(detections[i].get("center_px_x", 0.0))
+            yi = float(detections[i].get("center_px_y", 0.0))
+            box_i = (
+                float(detections[i]["bbox_x1"]),
+                float(detections[i]["bbox_y1"]),
+                float(detections[i]["bbox_x2"]),
+                float(detections[i]["bbox_y2"]),
+            )
+
+            for j in range(i + 1, len(detections)):
+                xj = float(detections[j].get("center_px_x", 0.0))
+                yj = float(detections[j].get("center_px_y", 0.0))
+                box_j = (
+                    float(detections[j]["bbox_x1"]),
+                    float(detections[j]["bbox_y1"]),
+                    float(detections[j]["bbox_x2"]),
+                    float(detections[j]["bbox_y2"]),
+                )
+
+                dx = abs(xi - xj)
+                dy = abs(yi - yj)
+                iou = bbox_iou_xyxy(box_i, box_j)
+
+                same_line = dx <= AMBIGUOUS_X_PX and dy <= AMBIGUOUS_Y_PX
+                slight_overlap = iou >= AMBIGUOUS_IOU_THRESH
+
+                if same_line or slight_overlap:
+                    flags[i] = True
+                    flags[j] = True
+
+        return flags
+
+    def _update_track(self, sid: int, det: dict, frame_idx: int, occluded: bool, ambiguous: bool) -> None:
         tr = self.tracks[sid]
 
         dtf = max(1, frame_idx - tr.last_seen_frame)
@@ -943,7 +992,8 @@ class IdentityManager:
                 if n > 1e-8:
                     tr.clip_feat = (tr.clip_feat / n).astype(np.float32)
 
-            if not (occluded and OCCLUSION_FREEZE_BANK_UPDATE):
+            freeze_clip_bank = (occluded and OCCLUSION_FREEZE_BANK_UPDATE) or (ambiguous and AMBIGUOUS_FREEZE_BANK_UPDATE)
+            if not freeze_clip_bank:
                 tr.clip_bank = self._push_bank(tr.clip_bank, new_clip, MEMORY_BANK_SIZE)
 
         new_color = det.get("color_feat")
@@ -953,7 +1003,8 @@ class IdentityManager:
             else:
                 tr.color_feat = (COLOR_EMA_ALPHA * new_color + (1.0 - COLOR_EMA_ALPHA) * tr.color_feat).astype(np.float32)
 
-            if not (occluded and OCCLUSION_FREEZE_BANK_UPDATE):
+            freeze_color_bank = (occluded and OCCLUSION_FREEZE_BANK_UPDATE) or (ambiguous and AMBIGUOUS_FREEZE_BANK_UPDATE)
+            if not freeze_color_bank:
                 tr.color_bank = self._push_bank(tr.color_bank, new_color, MEMORY_BANK_SIZE)
 
         tr.box_h = SIZE_ALPHA * float(det.get("box_h", tr.box_h)) + (1.0 - SIZE_ALPHA) * tr.box_h
@@ -993,6 +1044,7 @@ class IdentityManager:
             return
 
         occlusion_flags = self._compute_occlusion_flags(detections)
+        ambiguity_flags = self._compute_ambiguity_flags(detections)
 
         track_ids = self.stable_ids
         num_tracks = len(track_ids)
@@ -1004,7 +1056,11 @@ class IdentityManager:
             tr = self.tracks[sid]
             for c, det in enumerate(detections):
                 occluded = occlusion_flags[c]
+                ambiguous = ambiguity_flags[c]
                 cost_matrix[r, c] = self._total_cost(tr, det, frame_idx, occluded)
+
+                if ambiguous:
+                    cost_matrix[r, c] += 0.08
 
                 raw_tid = det.get("track_id")
                 if tr.raw_tracker_id is not None and raw_tid is not None and int(raw_tid) == int(tr.raw_tracker_id):
@@ -1029,7 +1085,10 @@ class IdentityManager:
             motion_dist_ok = motion_cost <= clamp01(OUTSIDER_DIST_M / max(1e-6, self.max_match_dist_m))
 
             strong_identity = clip_sim >= OUTSIDER_CLIP_MIN_SIM
-            acceptable_total = total_cost <= MAX_ACCEPT_COST
+
+            ambiguous = ambiguity_flags[c]
+            local_max_accept = AMBIGUOUS_MAX_ACCEPT_COST if ambiguous else MAX_ACCEPT_COST
+            acceptable_total = total_cost <= local_max_accept
 
             if acceptable_total and (motion_dist_ok or strong_identity):
                 proposed[sid] = c
@@ -1038,6 +1097,7 @@ class IdentityManager:
             tr = self.tracks[sid]
             det = detections[det_idx]
             occluded = occlusion_flags[det_idx]
+            ambiguous = ambiguity_flags[det_idx]
 
             row_ix = track_ids.index(sid)
             assigned_cost = float(cost_matrix[row_ix, det_idx])
@@ -1054,8 +1114,16 @@ class IdentityManager:
             )
 
             accept = True
-            local_switch_margin = SWITCH_MARGIN + (OCCLUSION_EXTRA_STICKINESS if occluded else 0.0)
-            local_confirm = SWITCH_CONFIRM_FRAMES + (2 if occluded else 0)
+            local_switch_margin = SWITCH_MARGIN
+            local_confirm = SWITCH_CONFIRM_FRAMES
+
+            if occluded:
+                local_switch_margin += OCCLUSION_EXTRA_STICKINESS
+                local_confirm += 2
+
+            if ambiguous:
+                local_switch_margin += AMBIGUOUS_EXTRA_SWITCH_MARGIN
+                local_confirm += AMBIGUOUS_EXTRA_CONFIRM_FRAMES
 
             if not same_raw and second_best_cost is not None:
                 improvement = second_best_cost - assigned_cost
@@ -1082,7 +1150,7 @@ class IdentityManager:
             if accept:
                 det["stable_id"] = sid
                 det["side_group"] = "ALL"
-                self._update_track(sid, det, frame_idx, occluded)
+                self._update_track(sid, det, frame_idx, occluded, ambiguous)
 
 
 # ----------------------------
@@ -1405,6 +1473,8 @@ def main():
                         x1, y1, x2, y2 = xyxy.astype(float)
                         foot_px_x = (x1 + x2) / 2.0
                         foot_px_y = y2
+                        center_px_x = float((x1 + x2) / 2.0)
+                        center_px_y = float((y1 + y2) / 2.0)
 
                         x_m, y_m = px_to_meters(H, foot_px_x, foot_px_y)
                         x_m = float(np.clip(x_m, 0.0, COURT_W))
@@ -1425,6 +1495,7 @@ def main():
                             "bbox_x1": float(x1), "bbox_y1": float(y1),
                             "bbox_x2": float(x2), "bbox_y2": float(y2),
                             "foot_px_x": float(foot_px_x), "foot_px_y": float(foot_px_y),
+                            "center_px_x": center_px_x, "center_px_y": center_px_y,
                             "foot_poly_dist": float(foot_poly_dist),
                             "x_m": x_m, "y_m": y_m,
                             "zone": zone,
@@ -1530,6 +1601,8 @@ def main():
                         row_out.pop("box_w", None)
                         row_out.pop("box_h", None)
                         row_out.pop("foot_poly_dist", None)
+                        row_out.pop("center_px_x", None)
+                        row_out.pop("center_px_y", None)
 
                         row_out.setdefault("stable_id", -1)
                         row_out.setdefault("side_group", "ALL")
@@ -1553,7 +1626,7 @@ def main():
 
             cv2.putText(
                 annotated,
-                f"CLIP identity + outsider gate | conf={CONF} iou={IOU} imgsz={IMGSZ}",
+                f"CLIP identity + ambiguity handling | conf={CONF} iou={IOU} imgsz={IMGSZ}",
                 (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA,
             )
             cv2.putText(
