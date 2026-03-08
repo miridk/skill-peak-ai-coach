@@ -42,11 +42,11 @@ COURT_DST = np.array(
 )
 
 # Detection
-COURT_MARGIN_PX = 75          # top margin
-SIDE_BOTTOM_MARGIN_PX = 25    # left, right and bottom margin
+COURT_MARGIN_PX = 85         # top margin
+SIDE_BOTTOM_MARGIN_PX = 2    # left, right and bottom margin
 CONF = 0.45
 IOU = 0.6
-IMGSZ = 960
+IMGSZ = 1080
 
 # Logical players for doubles
 PLAYER_IDS = [1, 2, 3, 4]
@@ -61,17 +61,24 @@ MAX_AGE_SECONDS = 3.0
 MAX_MATCH_DIST_M = 3.2
 
 # Assignment weights
-W_CLIP = 0.58
-W_MOTION = 0.16
-W_COLOR = 0.10
+W_CLIP = 0.50
+W_MOTION = 0.22
+W_COLOR = 0.08
 W_SIZE = 0.05
-W_SIDE = 0.11
-W_EDGE = 0.10
+W_SIDE = 0.17
+W_EDGE = 0.08
 
 # Anti-switch
 SWITCH_MARGIN = 0.14
 SWITCH_CONFIRM_FRAMES = 8
 UNMATCHED_COST = 1.15
+
+# Stronger anti-swap pair logic
+PAIR_SWAP_MAX_M = 1.10
+PAIR_SWAP_IOU_THRESH = 0.02
+PAIR_SWAP_COST_MARGIN = 0.18
+PAIR_SWAP_HIT_MIN = 18
+PAIR_SWAP_AMBIGUOUS_BONUS = 0.12
 
 # Outsider rejection
 MAX_ACCEPT_COST = 0.72
@@ -96,15 +103,17 @@ OCCLUSION_FREEZE_BANK_UPDATE = True
 # Side plausibility
 SIDE_PENALTY = 0.22
 SIDE_GRACE_FRAMES = 20
+HARD_SIDE_PENALTY = 0.38
+HARD_SIDE_HITS_MIN = 20
 
 # Line ambiguity / same-row handling
-AMBIGUOUS_X_PX = 95
-AMBIGUOUS_Y_PX = 240
-AMBIGUOUS_IOU_THRESH = 0.05
-AMBIGUOUS_EXTRA_SWITCH_MARGIN = 0.18
-AMBIGUOUS_EXTRA_CONFIRM_FRAMES = 4
+AMBIGUOUS_X_PX = 115
+AMBIGUOUS_Y_PX = 265
+AMBIGUOUS_IOU_THRESH = 0.03
+AMBIGUOUS_EXTRA_SWITCH_MARGIN = 0.40
+AMBIGUOUS_EXTRA_CONFIRM_FRAMES = 10
 AMBIGUOUS_FREEZE_BANK_UPDATE = True
-AMBIGUOUS_MAX_ACCEPT_COST = 0.60
+AMBIGUOUS_MAX_ACCEPT_COST = 0.42
 
 # Live stats overlay settings
 SPEED_SMOOTH_ALPHA = 0.35
@@ -818,8 +827,14 @@ class IdentityManager:
         px, py = self._predict_xy(tr, frame_idx)
         d = math.hypot(float(det["x_m"]) - px, float(det["y_m"]) - py)
         base = clamp01(d / max(1e-6, self.max_match_dist_m))
+
+        # Give slightly more trust to motion for established tracks.
+        if tr.hits >= 12:
+            base *= 0.92
+
         if occluded:
             base = max(0.0, base - OCCLUSION_MOTION_BOOST)
+
         return base
 
     def _clip_cost(self, tr: IdentityTrack, det: dict, occluded: bool) -> float:
@@ -882,8 +897,13 @@ class IdentityManager:
         if current_side == tr.preferred_side:
             return 0.0
 
+        # very established player -> stronger side lock
+        if tr.hits >= HARD_SIDE_HITS_MIN and tr.side_stable_frames >= SIDE_GRACE_FRAMES:
+            return HARD_SIDE_PENALTY
+
         if tr.side_stable_frames < SIDE_GRACE_FRAMES:
             return SIDE_PENALTY
+
         return SIDE_PENALTY * 0.55
 
     def _edge_cost(self, det: dict) -> float:
@@ -968,6 +988,166 @@ class IdentityManager:
 
         return flags
 
+    def _compute_occlusion_flags(self, detections: List[dict]) -> List[bool]:
+        flags = [False] * len(detections)
+        for i in range(len(detections)):
+            box_i = (
+                float(detections[i]["bbox_x1"]),
+                float(detections[i]["bbox_y1"]),
+                float(detections[i]["bbox_x2"]),
+                float(detections[i]["bbox_y2"]),
+            )
+            for j in range(i + 1, len(detections)):
+                box_j = (
+                    float(detections[j]["bbox_x1"]),
+                    float(detections[j]["bbox_y1"]),
+                    float(detections[j]["bbox_x2"]),
+                    float(detections[j]["bbox_y2"]),
+                )
+                iou = bbox_iou_xyxy(box_i, box_j)
+                if iou >= OCCLUSION_IOU_THRESH:
+                    flags[i] = True
+                    flags[j] = True
+        return flags
+
+    def _det_pair_is_close(self, a: dict, b: dict) -> bool:
+        dx_m = float(a["x_m"]) - float(b["x_m"])
+        dy_m = float(a["y_m"]) - float(b["y_m"])
+        dist_m = math.hypot(dx_m, dy_m)
+
+        box_a = (
+            float(a["bbox_x1"]),
+            float(a["bbox_y1"]),
+            float(a["bbox_x2"]),
+            float(a["bbox_y2"]),
+        )
+        box_b = (
+            float(b["bbox_x1"]),
+            float(b["bbox_y1"]),
+            float(b["bbox_x2"]),
+            float(b["bbox_y2"]),
+        )
+        iou = bbox_iou_xyxy(box_a, box_b)
+
+        return dist_m <= PAIR_SWAP_MAX_M or iou >= PAIR_SWAP_IOU_THRESH
+
+    def _anti_swap_pairs(
+        self,
+        proposed: Dict[int, int],
+        detections: List[dict],
+        cost_matrix: np.ndarray,
+        track_ids: List[int],
+        occlusion_flags: List[bool],
+        ambiguity_flags: List[bool],
+        frame_idx: int,
+    ) -> Dict[int, int]:
+        """
+        Prevents two established tracks from swapping identities in close / ambiguous situations.
+        """
+        if len(proposed) < 2:
+            return proposed
+
+        out = dict(proposed)
+        sids = list(proposed.keys())
+
+        for i in range(len(sids)):
+            sid_a = sids[i]
+            det_a_idx = out.get(sid_a)
+            if det_a_idx is None:
+                continue
+
+            tr_a = self.tracks[sid_a]
+            det_a = detections[det_a_idx]
+
+            for j in range(i + 1, len(sids)):
+                sid_b = sids[j]
+                det_b_idx = out.get(sid_b)
+                if det_b_idx is None or det_b_idx == det_a_idx:
+                    continue
+
+                tr_b = self.tracks[sid_b]
+                det_b = detections[det_b_idx]
+
+                # only care about established players
+                if tr_a.hits < PAIR_SWAP_HIT_MIN or tr_b.hits < PAIR_SWAP_HIT_MIN:
+                    continue
+
+                # only care when detections are close / overlapping
+                if not self._det_pair_is_close(det_a, det_b):
+                    continue
+
+                amb = ambiguity_flags[det_a_idx] or ambiguity_flags[det_b_idx]
+                occ = occlusion_flags[det_a_idx] or occlusion_flags[det_b_idx]
+
+                row_a = track_ids.index(sid_a)
+                row_b = track_ids.index(sid_b)
+
+                # cost of chosen assignment
+                chosen_cost = float(cost_matrix[row_a, det_a_idx] + cost_matrix[row_b, det_b_idx])
+
+                # cost if pair were swapped
+                alt_cost = float(cost_matrix[row_a, det_b_idx] + cost_matrix[row_b, det_a_idx])
+
+                margin = PAIR_SWAP_COST_MARGIN
+                if amb:
+                    margin += PAIR_SWAP_AMBIGUOUS_BONUS
+                if occ:
+                    margin += 0.06
+
+                # If swapped alternative is only marginally better,
+                # prefer stability for established players.
+                if alt_cost <= chosen_cost + margin:
+                    raw_a = det_a.get("track_id")
+                    raw_b = det_b.get("track_id")
+
+                    keep_a = (
+                        tr_a.raw_tracker_id is not None
+                        and raw_a is not None
+                        and int(tr_a.raw_tracker_id) == int(raw_a)
+                    )
+                    keep_b = (
+                        tr_b.raw_tracker_id is not None
+                        and raw_b is not None
+                        and int(tr_b.raw_tracker_id) == int(raw_b)
+                    )
+
+                    # If both align with prior raw ids, keep them as-is.
+                    if keep_a and keep_b:
+                        continue
+
+                    # If one aligns strongly with prior history and the other does not,
+                    # do not let the weak one drag the stable one into a swap.
+                    if keep_a and not keep_b:
+                        out[sid_a] = det_a_idx
+                        continue
+
+                    if keep_b and not keep_a:
+                        out[sid_b] = det_b_idx
+                        continue
+
+                    # Extra side-lock check: if both tracks have strong preferred sides,
+                    # prefer the assignment that preserves side plausibility.
+                    det_a_side = side_from_y(float(det_a["y_m"]))
+                    det_b_side = side_from_y(float(det_b["y_m"]))
+
+                    chosen_side_penalty = 0.0
+                    swapped_side_penalty = 0.0
+
+                    if tr_a.preferred_side is not None and det_a_side != tr_a.preferred_side:
+                        chosen_side_penalty += 1.0
+                    if tr_b.preferred_side is not None and det_b_side != tr_b.preferred_side:
+                        chosen_side_penalty += 1.0
+
+                    if tr_a.preferred_side is not None and det_b_side != tr_a.preferred_side:
+                        swapped_side_penalty += 1.0
+                    if tr_b.preferred_side is not None and det_a_side != tr_b.preferred_side:
+                        swapped_side_penalty += 1.0
+
+                    if chosen_side_penalty <= swapped_side_penalty:
+                        continue
+
+        return out
+
     def _update_track(self, sid: int, det: dict, frame_idx: int, occluded: bool, ambiguous: bool) -> None:
         tr = self.tracks[sid]
 
@@ -1017,28 +1197,6 @@ class IdentityManager:
         tr.hits += 1
         self._update_side_memory(tr, det)
 
-    def _compute_occlusion_flags(self, detections: List[dict]) -> List[bool]:
-        flags = [False] * len(detections)
-        for i in range(len(detections)):
-            box_i = (
-                float(detections[i]["bbox_x1"]),
-                float(detections[i]["bbox_y1"]),
-                float(detections[i]["bbox_x2"]),
-                float(detections[i]["bbox_y2"]),
-            )
-            for j in range(i + 1, len(detections)):
-                box_j = (
-                    float(detections[j]["bbox_x1"]),
-                    float(detections[j]["bbox_y1"]),
-                    float(detections[j]["bbox_x2"]),
-                    float(detections[j]["bbox_y2"]),
-                )
-                iou = bbox_iou_xyxy(box_i, box_j)
-                if iou >= OCCLUSION_IOU_THRESH:
-                    flags[i] = True
-                    flags[j] = True
-        return flags
-
     def assign(self, frame_idx: int, detections: List[dict]) -> None:
         if not detections or not self.is_bootstrapped():
             return
@@ -1057,15 +1215,18 @@ class IdentityManager:
             for c, det in enumerate(detections):
                 occluded = occlusion_flags[c]
                 ambiguous = ambiguity_flags[c]
-                cost_matrix[r, c] = self._total_cost(tr, det, frame_idx, occluded)
+
+                base_cost = self._total_cost(tr, det, frame_idx, occluded)
 
                 if ambiguous:
-                    cost_matrix[r, c] += 0.08
+                    base_cost += 0.08
 
                 raw_tid = det.get("track_id")
                 if tr.raw_tracker_id is not None and raw_tid is not None and int(raw_tid) == int(tr.raw_tracker_id):
                     stickiness = OCCLUSION_EXTRA_STICKINESS if occluded else 0.08
-                    cost_matrix[r, c] = max(0.0, cost_matrix[r, c] - stickiness)
+                    base_cost = max(0.0, base_cost - stickiness)
+
+                cost_matrix[r, c] = base_cost
 
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
@@ -1092,6 +1253,16 @@ class IdentityManager:
 
             if acceptable_total and (motion_dist_ok or strong_identity):
                 proposed[sid] = c
+
+        proposed = self._anti_swap_pairs(
+            proposed=proposed,
+            detections=detections,
+            cost_matrix=cost_matrix,
+            track_ids=track_ids,
+            occlusion_flags=occlusion_flags,
+            ambiguity_flags=ambiguity_flags,
+            frame_idx=frame_idx,
+        )
 
         for sid, det_idx in proposed.items():
             tr = self.tracks[sid]
@@ -1399,7 +1570,7 @@ def main():
     jsonl_f = open(jsonl_path, "w", encoding="utf-8")
 
     print("Loading YOLO...")
-    model = YOLO("yolo11n.pt")
+    model = YOLO("yolo11m.pt")
     tracker = sv.ByteTrack()
 
     max_age_frames = int(MAX_AGE_SECONDS * fps)
@@ -1626,7 +1797,7 @@ def main():
 
             cv2.putText(
                 annotated,
-                f"CLIP identity + ambiguity handling | conf={CONF} iou={IOU} imgsz={IMGSZ}",
+                f"CLIP identity + ambiguity handling + anti-swap | conf={CONF} iou={IOU} imgsz={IMGSZ}",
                 (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA,
             )
             cv2.putText(
