@@ -1,10 +1,10 @@
 # =====================================================
-# BADMINTON TRACKER - ULTIMATE VERSION (rettet alle fejl)
+# BADMINTON TRACKER - ULTIMATE VERSION (med lang memory direction)
 # =====================================================
-# Fixes: angle_deg, resize_keep_aspect, extract_pose_signature, compute_ready_from_pose, maybe_rescue_assignment
+# Ændring: Velocity + direction prediction over 12 frames + 0.45 straf ved modsat retning
+# Fixes: tilføjet manglende _direction_cost
 # Alle definitioner før brug → ingen NameError
 # Elipser, overlay, speed/dist/accel, ready %, csv/jsonl bevaret
-# + direction cost, vægtede banks, inside-bootstrap
 
 import os
 import json
@@ -18,7 +18,7 @@ import open_clip
 from PIL import Image
 from scipy.optimize import linear_sum_assignment
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from ultralytics import YOLO
@@ -94,6 +94,9 @@ MEMORY_BANK_SIZE = 18
 MEMORY_MATCH_TOPK = 5
 POSE_EMA_ALPHA = 0.22
 POSE_BANK_SIZE = 14
+
+VELOCITY_HISTORY_FRAMES = 40
+LONG_TERM_DIRECTION_FRAMES = 0.60
 
 OCCLUSION_IOU_THRESH = 0.18
 OCCLUSION_EXTRA_STICKINESS = 0.16
@@ -441,7 +444,7 @@ def click_players(frame0: np.ndarray, num_players: int = 4) -> list[list[int]]:
 
 
 # ----------------------------
-# POSE FUNCTIONS (nu i korrekt rækkefølge)
+# POSE FUNCTIONS
 # ----------------------------
 def angle_deg(a, b, c):
     ax, ay = a
@@ -575,7 +578,23 @@ class LiveState:
 
 
 def init_state(t: float, x_m: float, y_m: float) -> LiveState:
-    return LiveState(t, x_m, y_m, 0.0, 0.0, 0.0, 0.0, 0.0, 175.0, 0.0, 0, 0, -999999, None, 0)
+    return LiveState(
+        last_t=t,
+        last_x=x_m,
+        last_y=y_m,
+        speed_kmh_ema=0.0,
+        speed_mps_ema=0.0,
+        accel_mps2_ema=0.0,
+        prev_speed_mps=0.0,
+        total_dist_m=0.0,
+        knee_angle_ema=175.0,
+        hip_drop_ema=0.0,
+        ready_frames=0,
+        total_frames=0,
+        last_pose_frame=-999999,
+        last_knee_angle=None,
+        last_ready_flag=0
+    )
 
 
 def update_motion(states: Dict[int, LiveState], stable_id: int, t: float, x_m: float, y_m: float):
@@ -744,15 +763,13 @@ def draw_player_overlay(frame, bbox_xyxy, stable_id, knee_angle_avg, ready_pct, 
 
 
 # ----------------------------
-# IDENTITY MANAGER (fuld version – nu med alle metoder)
+# IDENTITY MANAGER (med lang memory direction prediction + rettet _direction_cost)
 # ----------------------------
 @dataclass
 class IdentityTrack:
     stable_id: int
     last_x: float
     last_y: float
-    vx: float
-    vy: float
     last_seen_frame: int
     clip_feat: Optional[np.ndarray]
     color_feat: Optional[np.ndarray]
@@ -763,6 +780,10 @@ class IdentityTrack:
     box_h: float
     box_w: float
     raw_tracker_id: Optional[int]
+
+    # Fields with defaults come LAST
+    vx_history: List[float] = field(default_factory=list)
+    vy_history: List[float] = field(default_factory=list)
     hits: int = 1
     pending_raw_tid: Optional[int] = None
     pending_count: int = 0
@@ -812,12 +833,10 @@ class IdentityManager:
                 pose_bank = [det.get("pose_feat")] if det.get("pose_feat") is not None else []
                 pref_side = side_from_y(float(det["y_m"]))
                 pref_role = depth_role_from_y(float(det["y_m"]))
-                self.tracks[sid] = IdentityTrack(
+                track = IdentityTrack(
                     stable_id=sid,
                     last_x=float(det["x_m"]),
                     last_y=float(det["y_m"]),
-                    vx=0.0,
-                    vy=0.0,
                     last_seen_frame=int(det["frame_idx"]),
                     clip_feat=det.get("clip_feat"),
                     color_feat=det.get("color_feat"),
@@ -828,12 +847,15 @@ class IdentityManager:
                     box_h=float(det.get("box_h", 0.0)),
                     box_w=float(det.get("box_w", 0.0)),
                     raw_tracker_id=int(det.get("track_id", -1)),
+                    vx_history=[],
+                    vy_history=[],
                     hits=1,
                     preferred_side=pref_side,
                     side_stable_frames=1,
                     preferred_role=pref_role,
                     role_stable_frames=1,
                 )
+                self.tracks[sid] = track
                 det["stable_id"] = sid
                 det["side_group"] = "ALL"
 
@@ -846,8 +868,25 @@ class IdentityManager:
         return bank
 
     def _predict_xy(self, tr: IdentityTrack, frame_idx: int) -> Tuple[float, float]:
+        if tr.hits < 2:
+            return tr.last_x, tr.last_y
+
+        # Lang memory – vægtet gennemsnit over op til 12 frames
+        history_len = min(len(tr.vx_history), VELOCITY_HISTORY_FRAMES)
+        if history_len == 0:
+            return tr.last_x, tr.last_y
+
+        # Eksponentielt faldende vægt: nyeste ~1.0, ældste ~0.05
+        weights = np.exp(np.linspace(0, -3, history_len))
+        weights /= weights.sum()
+
+        weighted_vx = np.sum(np.array(tr.vx_history[-history_len:]) * weights)
+        weighted_vy = np.sum(np.array(tr.vy_history[-history_len:]) * weights)
+
         dtf = max(1, frame_idx - tr.last_seen_frame)
-        return tr.last_x + tr.vx * dtf, tr.last_y + tr.vy * dtf
+        pred_x = tr.last_x + weighted_vx * dtf
+        pred_y = tr.last_y + weighted_vy * dtf
+        return pred_x, pred_y
 
     def _direction_cost(self, tr: IdentityTrack, det: dict, frame_idx: int) -> float:
         if tr.hits < 6:
@@ -870,6 +909,31 @@ class IdentityManager:
         direction_cost = (1.0 - cos_sim) / 2.0
 
         return direction_cost * (0.48 if len_new > 0.35 else 0.22)
+
+    def _long_term_direction_cost(self, tr: IdentityTrack, det: dict, frame_idx: int) -> float:
+        if len(tr.vx_history) < 3:
+            return 0.0
+
+        pred_x, pred_y = self._predict_xy(tr, frame_idx)
+        dx_pred = pred_x - tr.last_x
+        dy_pred = pred_y - tr.last_y
+        len_pred = math.hypot(dx_pred, dy_pred)
+        if len_pred < 0.08:
+            return 0.0
+
+        dx_new = float(det["x_m"]) - tr.last_x
+        dy_new = float(det["y_m"]) - tr.last_y
+        len_new = math.hypot(dx_new, dy_new)
+        if len_new < 0.05:
+            return 0.45
+
+        cos_sim = (dx_pred * dx_new + dy_pred * dy_new) / (len_pred * len_new + 1e-8)
+        cos_sim = max(-1.0, min(1.0, cos_sim))
+        direction_cost = (1.0 - cos_sim) / 2.0
+
+        if cos_sim < -0.2:
+            return direction_cost * 0.9 + 0.45
+        return direction_cost * 0.35
 
     def _clip_cost(self, tr: IdentityTrack, det: dict, occluded: bool) -> float:
         feat = det.get("clip_feat")
@@ -973,6 +1037,7 @@ class IdentityManager:
         role_c = self._role_cost(tr, det)
         lateral_c = self._lateral_cross_penalty(tr, det)
         direction_c = self._direction_cost(tr, det, frame_idx)
+        long_term_direction_c = self._long_term_direction_cost(tr, det, frame_idx)
 
         dist_to_net = abs(float(det["y_m"]) - COURT_L / 2.0)
         near_net = dist_to_net < NET_DISTANCE_THRESHOLD_M
@@ -990,7 +1055,8 @@ class IdentityManager:
             w_pose * pose_c +
             role_final +
             LATERAL_CROSS_WEIGHT * lateral_c +
-            W_DIRECTION * direction_c
+            W_DIRECTION * direction_c +
+            LONG_TERM_DIRECTION_FRAMES * long_term_direction_c
         )
 
     def _update_side_memory(self, tr: IdentityTrack, det: dict):
@@ -1128,8 +1194,16 @@ class IdentityManager:
         dtf = max(1, frame_idx - tr.last_seen_frame)
         nvx = (float(det["x_m"]) - tr.last_x) / dtf
         nvy = (float(det["y_m"]) - tr.last_y) / dtf
-        tr.vx = VEL_ALPHA * nvx + (1.0 - VEL_ALPHA) * tr.vx
-        tr.vy = VEL_ALPHA * nvy + (1.0 - VEL_ALPHA) * tr.vy
+
+    # Opdater velocity-historik (begræns til 12 frames)
+        tr.vx_history.append(nvx)
+        tr.vy_history.append(nvy)
+        if len(tr.vx_history) > VELOCITY_HISTORY_FRAMES:
+            tr.vx_history = tr.vx_history[-VELOCITY_HISTORY_FRAMES:]
+            tr.vy_history = tr.vy_history[-VELOCITY_HISTORY_FRAMES:]
+
+    # Ingen tr.vx / tr.vy mere – vi bruger kun historikken fremover
+
         tr.last_x = float(det["x_m"])
         tr.last_y = float(det["y_m"])
         tr.last_seen_frame = int(frame_idx)
