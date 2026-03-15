@@ -82,7 +82,7 @@ PAIR_SWAP_COST_MARGIN = 0.24
 PAIR_SWAP_HIT_MIN = 18
 PAIR_SWAP_AMBIGUOUS_BONUS = 0.12
 
-MAX_ACCEPT_COST = 0.72
+MAX_ACCEPT_COST = 0.72 #TODO PRØV AT SÆNGE DENNE
 OUTSIDER_DIST_M = 1.75
 OUTSIDER_CLIP_MIN_SIM = 0.58
 
@@ -95,8 +95,11 @@ MEMORY_MATCH_TOPK = 5
 POSE_EMA_ALPHA = 0.22
 POSE_BANK_SIZE = 14
 
-VELOCITY_HISTORY_FRAMES = 40
-LONG_TERM_DIRECTION_FRAMES = 0.60
+#TODO - I NEED TO PLAY WITH THESE VALUES
+VELOCITY_HISTORY_FRAMES = 300
+LONG_TERM_DIRECTION_FRAMES = 0.15
+LINESPACE_FRAMES = -3 #how much weight to give to the history frames Less number = more weight to the old frame
+DIRECTION_COST = 0.9 + 0.45 #Higer number = higher penalty
 
 OCCLUSION_IOU_THRESH = 0.18
 OCCLUSION_EXTRA_STICKINESS = 0.16
@@ -877,7 +880,7 @@ class IdentityManager:
             return tr.last_x, tr.last_y
 
         # Eksponentielt faldende vægt: nyeste ~1.0, ældste ~0.05
-        weights = np.exp(np.linspace(0, -3, history_len))
+        weights = np.exp(np.linspace(0, LINESPACE_FRAMES, history_len))
         weights /= weights.sum()
 
         weighted_vx = np.sum(np.array(tr.vx_history[-history_len:]) * weights)
@@ -932,7 +935,7 @@ class IdentityManager:
         direction_cost = (1.0 - cos_sim) / 2.0
 
         if cos_sim < -0.2:
-            return direction_cost * 0.9 + 0.45
+            return direction_cost * DIRECTION_COST
         return direction_cost * 0.35
 
     def _clip_cost(self, tr: IdentityTrack, det: dict, occluded: bool) -> float:
