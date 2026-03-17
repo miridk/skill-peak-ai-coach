@@ -24,12 +24,18 @@ from typing import Dict, List, Optional, Tuple
 from ultralytics import YOLO
 import supervision as sv
 import mediapipe as mp
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.vision import PoseLandmarker, PoseLandmarkerOptions
+from mediapipe.tasks.python.core.base_options import BaseOptions
+
+import tkinter as tk
+from tkinter import filedialog
 
 
 # ----------------------------
 # CONFIG
 # ----------------------------
-VIDEO_PATH = "input.mp4"
+# VIDEO_PATH = "input.mp4"
 SAVE_DIR = "save"
 EXPORT_DIR = "exports"
 
@@ -159,6 +165,33 @@ READY_HIP_DROP_MIN = 0.04
 READY_MAX_SPEED_KMH = 6.0
 READY_SMOOTH_ALPHA = 0.35
 READY_HIP_SMOOTH_ALPHA = 0.35
+
+print("Torch CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+
+# ============================
+# CONFIG - VIDEO SELECTION
+# ============================
+
+def select_video() -> str:
+    root = tk.Tk()
+    root.withdraw()          # Hide the main tkinter window
+    root.wm_attributes('-topmost', 1)  # Bring dialog to front
+
+    file_path = filedialog.askopenfilename(
+        title="Select Badminton Video",
+        filetypes=[
+            ("Video files", "*.mp4 *.avi *.mov *.mkv *.MOV"),
+            ("All files", "*.*")
+        ]
+    )
+    
+    if not file_path:
+        raise RuntimeError("No video file selected. Exiting.")
+    
+    print(f"✅ Selected video: {file_path}")
+    return file_path
 
 clicked_points = []
 clicked_player_points = []
@@ -1348,6 +1381,9 @@ class IdentityManager:
 # MAIN
 # ----------------------------
 def main():
+
+    VIDEO_PATH = select_video()
+
     if not os.path.exists(VIDEO_PATH):
         raise RuntimeError(f"Fil findes ikke: {VIDEO_PATH}")
 
@@ -1402,14 +1438,17 @@ def main():
     identity = IdentityManager(PLAYER_IDS, max_age_frames, MAX_MATCH_DIST_M)
     live_states: Dict[int, LiveState] = {}
 
-    mp_pose = mp.solutions.pose
-    pose = mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        enable_segmentation=False,
-        min_detection_confidence=0.4,
-        min_tracking_confidence=0.4,
+    pose_options = PoseLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path="pose_landmarker_full.task"),
+        running_mode=mp_vision.RunningMode.IMAGE,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+        output_segmentation_masks=False
     )
+
+    pose_landmarker = PoseLandmarker.create_from_options(pose_options)
 
     ensure_dir(SAVE_DIR)
     out_path = make_output_path(SAVE_DIR, VIDEO_PATH)
@@ -1495,7 +1534,29 @@ def main():
                             pose_crop = frame[by1:by2, bx1:bx2]
                             if pose_crop.size > 0:
                                 pose_crop_small, _ = resize_keep_aspect(pose_crop, POSE_CROP_MAX_W, POSE_CROP_MAX_H)
-                                pose_res = pose.process(cv2.cvtColor(pose_crop_small, cv2.COLOR_BGR2RGB))
+                                
+                                # Ny MediaPipe Tasks API
+                                mp_image = mp.Image(
+                                    image_format=mp.ImageFormat.SRGB,
+                                    data=cv2.cvtColor(pose_crop_small, cv2.COLOR_BGR2RGB)
+                                )
+                                
+                                pose_result = pose_landmarker.detect(mp_image)
+                                
+                                # Tilpas til dit eksisterende kode (så du ikke skal ændre extract_pose_signature)
+                                if pose_result.pose_landmarks and len(pose_result.pose_landmarks) > 0:
+                                    class FakeLandmarks:
+                                        def __init__(self, landmarks):
+                                            self.landmark = landmarks
+
+                                    class FakePoseResult:
+                                        def __init__(self, landmarks):
+                                            self.pose_landmarks = FakeLandmarks(landmarks)
+
+                                    pose_res = FakePoseResult(pose_result.pose_landmarks[0])
+                                else:
+                                    pose_res = None
+
                                 pose_feat = extract_pose_signature(pose_res)
                                 knee_L, knee_R, knee_avg, hip_drop, ready_flag = compute_ready_from_pose(pose_res)
 
