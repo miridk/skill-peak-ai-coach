@@ -34,4 +34,14 @@ If there already is one available, then go to the root of the project and use th
 # Install Requirements #
 ########################
 
+winget install Python.Python.3.11
+deactivate
+Remove-Item .venv -Recurse -Force
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python --version
+python -m pip install --upgrade pip
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU')"
+
 pip install -r requirements.txt
