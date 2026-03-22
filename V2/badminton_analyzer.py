@@ -28,6 +28,10 @@ from mediapipe.tasks.python import vision as mp_vision
 from mediapipe.tasks.python.vision import PoseLandmarker, PoseLandmarkerOptions
 from mediapipe.tasks.python.core.base_options import BaseOptions
 
+import threading
+import queue as _queue
+from concurrent.futures import ThreadPoolExecutor
+
 import tkinter as tk
 from tkinter import filedialog
 
@@ -108,10 +112,16 @@ LINESPACE_FRAMES = -3 #how much weight to give to the history frames Less number
 DIRECTION_COST = 0.9 + 0.45 #Higer number = higher penalty
 
 OCCLUSION_IOU_THRESH = 0.18
-OCCLUSION_EXTRA_STICKINESS = 0.16
+OCCLUSION_EXTRA_STICKINESS = 0.26      # raised: resist ByteTrack swaps more during occlusion
 OCCLUSION_MOTION_BOOST = 0.08
-OCCLUSION_CLIP_REDUCE = 0.10
+OCCLUSION_CLIP_REDUCE = 0.0            # removed penalty — CLIP should stay strong during occlusion
 OCCLUSION_FREEZE_BANK_UPDATE = True
+OCCLUSION_FREEZE_EMA = True            # also freeze EMA features, not just banks
+OCCLUSION_POSITION_FREEZE = True       # dead-reckoning: don't update position from noisy detection
+
+POST_OCCLUSION_RECOVERY_FRAMES = 25   # frames to apply extra re-ID weight after occlusion ends
+POST_OCCLUSION_CLIP_WEIGHT = 0.45     # extra cost weight using pre-occlusion CLIP snapshot
+POST_OCCLUSION_COLOR_WEIGHT = 0.18    # extra cost weight using pre-occlusion color snapshot
 
 SIDE_PENALTY = 0.22
 SIDE_GRACE_FRAMES = 20
@@ -169,6 +179,11 @@ READY_HIP_SMOOTH_ALPHA = 0.35
 print("Torch CUDA available:", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("GPU:", torch.cuda.get_device_name(0))
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    print("cuDNN benchmark + TF32 enabled")
 
 # ============================
 # CONFIG - VIDEO SELECTION
@@ -203,7 +218,11 @@ clicked_player_points = []
 class ClipEmbedder:
     def __init__(self, model_name: str, pretrained: str, device: str):
         self.device = device
-        self.model, _, self.preprocess = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
+        self.use_fp16 = (device == "cuda")
+        precision = "fp16" if self.use_fp16 else "fp32"
+        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
+            model_name, pretrained=pretrained, precision=precision
+        )
         self.model = self.model.to(device)
         self.model.eval()
 
@@ -221,8 +240,11 @@ class ClipEmbedder:
         if not tensors:
             return outputs
         batch = torch.stack(tensors).to(self.device)
-        with torch.no_grad():
+        if self.use_fp16:
+            batch = batch.half()
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_fp16):
             feat = self.model.encode_image(batch)
+            feat = feat.float()
             feat = feat / feat.norm(dim=-1, keepdim=True)
             feat = feat.detach().cpu().numpy().astype(np.float32)
         for i, f in zip(idxs, feat):
@@ -827,6 +849,12 @@ class IdentityTrack:
     side_stable_frames: int = 0
     preferred_role: Optional[str] = None
     role_stable_frames: int = 0
+    # Occlusion recovery state
+    pre_occlusion_clip: Optional[np.ndarray] = None
+    pre_occlusion_color: Optional[np.ndarray] = None
+    pre_occlusion_pose: Optional[np.ndarray] = None
+    was_occluded: bool = False
+    post_occlusion_frames: int = 0
 
 
 class IdentityManager:
@@ -979,10 +1007,7 @@ class IdentityManager:
         if feat is None:
             return 0.45
         sim = max(sim_bank, sim_ema)
-        cost = 1.0 - sim
-        if occluded:
-            cost = min(1.0, cost + OCCLUSION_CLIP_REDUCE)
-        return cost
+        return 1.0 - sim
 
     def _motion_cost(self, tr: IdentityTrack, det: dict, frame_idx: int, occluded: bool) -> float:
         px, py = self._predict_xy(tr, frame_idx)
@@ -1081,7 +1106,7 @@ class IdentityManager:
         w_pose = W_POSE * (POSE_NET_BOOST_FACTOR if near_net else 1.0)
         role_final = role_c * (NET_ROLE_EXTRA_PENALTY if near_net else 1.0)
 
-        return (
+        base = (
             W_CLIP * clip_c +
             W_MOTION * motion_c +
             W_COLOR * color_c +
@@ -1094,6 +1119,21 @@ class IdentityManager:
             W_DIRECTION * direction_c +
             LONG_TERM_DIRECTION_FRAMES * long_term_direction_c
         )
+
+        # Post-occlusion recovery: compare against the pre-occlusion snapshot taken the moment
+        # the players entered overlap. This is the cleanest identity signal we have right after
+        # separation — the EMA features were frozen so this snapshot is uncontaminated.
+        if tr.post_occlusion_frames > 0:
+            recovery_w = tr.post_occlusion_frames / float(POST_OCCLUSION_RECOVERY_FRAMES)
+            if tr.pre_occlusion_clip is not None:
+                snap_sim = cosine_sim(tr.pre_occlusion_clip, det.get("clip_feat"))
+                snap_sim = clamp01((snap_sim + 1.0) * 0.5)
+                base += POST_OCCLUSION_CLIP_WEIGHT * recovery_w * (1.0 - snap_sim)
+            if tr.pre_occlusion_color is not None:
+                snap_color_sim = safe_hist_corr(tr.pre_occlusion_color, det.get("color_feat"))
+                base += POST_OCCLUSION_COLOR_WEIGHT * recovery_w * (1.0 - snap_color_sim)
+
+        return base
 
     def _update_side_memory(self, tr: IdentityTrack, det: dict):
         current_side = side_from_y(float(det["y_m"]))
@@ -1227,25 +1267,57 @@ class IdentityManager:
 
     def _update_track(self, sid: int, det: dict, frame_idx: int, occluded: bool, ambiguous: bool) -> None:
         tr = self.tracks[sid]
-        dtf = max(1, frame_idx - tr.last_seen_frame)
-        nvx = (float(det["x_m"]) - tr.last_x) / dtf
-        nvy = (float(det["y_m"]) - tr.last_y) / dtf
 
-    # Opdater velocity-historik (begræns til 12 frames)
-        tr.vx_history.append(nvx)
-        tr.vy_history.append(nvy)
-        if len(tr.vx_history) > VELOCITY_HISTORY_FRAMES:
-            tr.vx_history = tr.vx_history[-VELOCITY_HISTORY_FRAMES:]
-            tr.vy_history = tr.vy_history[-VELOCITY_HISTORY_FRAMES:]
+        # --- Occlusion transition detection ---
+        entering_occlusion = occluded and not tr.was_occluded
+        exiting_occlusion = not occluded and tr.was_occluded
 
-    # Ingen tr.vx / tr.vy mere – vi bruger kun historikken fremover
+        # Save a clean snapshot the moment occlusion starts, so we can use it for re-ID when players separate
+        if entering_occlusion:
+            tr.pre_occlusion_clip = tr.clip_feat.copy() if tr.clip_feat is not None else None
+            tr.pre_occlusion_color = tr.color_feat.copy() if tr.color_feat is not None else None
+            tr.pre_occlusion_pose = tr.pose_feat.copy() if tr.pose_feat is not None else None
 
-        tr.last_x = float(det["x_m"])
-        tr.last_y = float(det["y_m"])
+        # Arm the post-occlusion recovery window the moment occlusion ends
+        if exiting_occlusion:
+            tr.post_occlusion_frames = POST_OCCLUSION_RECOVERY_FRAMES
+
+        # Tick down recovery counter
+        if tr.post_occlusion_frames > 0:
+            tr.post_occlusion_frames -= 1
+
+        # --- Position + velocity ---
+        # During occlusion: dead-reckoning. The detected position is from an overlapping/merged box
+        # and is unreliable. Advance along the pre-occlusion trajectory instead so the velocity
+        # history doesn't get corrupted with noise.
+        if occluded and OCCLUSION_POSITION_FREEZE:
+            pred_x, pred_y = self._predict_xy(tr, frame_idx)
+            tr.last_x = float(np.clip(pred_x, 0.0, COURT_W))
+            tr.last_y = float(np.clip(pred_y, 0.0, COURT_L))
+            # vx_history stays frozen — velocity was reliable before occlusion
+        else:
+            dtf = max(1, frame_idx - tr.last_seen_frame)
+            nvx = (float(det["x_m"]) - tr.last_x) / dtf
+            nvy = (float(det["y_m"]) - tr.last_y) / dtf
+            tr.vx_history.append(nvx)
+            tr.vy_history.append(nvy)
+            if len(tr.vx_history) > VELOCITY_HISTORY_FRAMES:
+                tr.vx_history = tr.vx_history[-VELOCITY_HISTORY_FRAMES:]
+                tr.vy_history = tr.vy_history[-VELOCITY_HISTORY_FRAMES:]
+            tr.last_x = float(det["x_m"])
+            tr.last_y = float(det["y_m"])
+
         tr.last_seen_frame = int(frame_idx)
 
+        # --- Feature updates ---
+        # Two levels of freeze:
+        #   freeze_bank  – already existed, stops bank from accumulating bad crops
+        #   freeze_ema   – NEW: also stops the running EMA from drifting toward wrong appearance
+        freeze_bank = (occluded and OCCLUSION_FREEZE_BANK_UPDATE) or (ambiguous and AMBIGUOUS_FREEZE_BANK_UPDATE)
+        freeze_ema = occluded and OCCLUSION_FREEZE_EMA
+
         new_clip = det.get("clip_feat")
-        if new_clip is not None:
+        if new_clip is not None and not freeze_ema:
             if tr.clip_feat is None:
                 tr.clip_feat = new_clip.astype(np.float32)
             else:
@@ -1253,22 +1325,20 @@ class IdentityManager:
                 n = float(np.linalg.norm(tr.clip_feat))
                 if n > 1e-8:
                     tr.clip_feat /= n
-            freeze = (occluded and OCCLUSION_FREEZE_BANK_UPDATE) or (ambiguous and AMBIGUOUS_FREEZE_BANK_UPDATE)
-            if not freeze:
+            if not freeze_bank:
                 tr.clip_bank = self._push_bank(tr.clip_bank, new_clip, MEMORY_BANK_SIZE)
 
         new_color = det.get("color_feat")
-        if new_color is not None:
+        if new_color is not None and not freeze_ema:
             if tr.color_feat is None:
                 tr.color_feat = new_color.astype(np.float32)
             else:
                 tr.color_feat = (COLOR_EMA_ALPHA * new_color + (1.0 - COLOR_EMA_ALPHA) * tr.color_feat).astype(np.float32)
-            freeze = (occluded and OCCLUSION_FREEZE_BANK_UPDATE) or (ambiguous and AMBIGUOUS_FREEZE_BANK_UPDATE)
-            if not freeze:
+            if not freeze_bank:
                 tr.color_bank = self._push_bank(tr.color_bank, new_color, MEMORY_BANK_SIZE)
 
         new_pose = det.get("pose_feat")
-        if new_pose is not None:
+        if new_pose is not None and not freeze_ema:
             if tr.pose_feat is None:
                 tr.pose_feat = new_pose.astype(np.float32)
             else:
@@ -1276,18 +1346,21 @@ class IdentityManager:
                 n = float(np.linalg.norm(tr.pose_feat))
                 if n > 1e-8:
                     tr.pose_feat /= n
-            freeze = (occluded and OCCLUSION_FREEZE_BANK_UPDATE) or (ambiguous and AMBIGUOUS_FREEZE_BANK_UPDATE)
-            if not freeze:
+            if not freeze_bank:
                 tr.pose_bank = self._push_bank(tr.pose_bank, new_pose, POSE_BANK_SIZE)
 
-        tr.box_h = SIZE_ALPHA * float(det.get("box_h", tr.box_h)) + (1.0 - SIZE_ALPHA) * tr.box_h
-        tr.box_w = SIZE_ALPHA * float(det.get("box_w", tr.box_w)) + (1.0 - SIZE_ALPHA) * tr.box_w
+        # Box size and raw tracker — only update from clean (non-occluded) detections
+        if not occluded:
+            tr.box_h = SIZE_ALPHA * float(det.get("box_h", tr.box_h)) + (1.0 - SIZE_ALPHA) * tr.box_h
+            tr.box_w = SIZE_ALPHA * float(det.get("box_w", tr.box_w)) + (1.0 - SIZE_ALPHA) * tr.box_w
+            self._update_side_memory(tr, det)
+            self._update_role_memory(tr, det)
+
         raw_tid = det.get("track_id")
         if raw_tid is not None:
             tr.raw_tracker_id = int(raw_tid)
         tr.hits += 1
-        self._update_side_memory(tr, det)
-        self._update_role_memory(tr, det)
+        tr.was_occluded = occluded
 
     def assign(self, frame_idx: int, detections: List[dict]) -> None:
         if not detections or not self.is_bootstrapped():
@@ -1378,6 +1451,36 @@ class IdentityManager:
 
 
 # ----------------------------
+# THREADED FRAME READER
+# ----------------------------
+class FrameReader:
+    """Reads frames in a background thread so disk I/O overlaps GPU compute."""
+    def __init__(self, cap: cv2.VideoCapture, buffer_size: int = 4):
+        self._cap = cap
+        self._q = _queue.Queue(maxsize=buffer_size)
+        self._stopped = False
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        while not self._stopped:
+            if self._q.full():
+                threading.Event().wait(0.001)
+                continue
+            ok, frame = self._cap.read()
+            self._q.put((ok, frame))
+            if not ok:
+                break
+
+    def read(self):
+        return self._q.get()
+
+    def stop(self):
+        self._stopped = True
+        self._thread.join(timeout=2.0)
+
+
+# ----------------------------
 # MAIN
 # ----------------------------
 def main():
@@ -1417,6 +1520,7 @@ def main():
     cap = cv2.VideoCapture(VIDEO_PATH)
     if not cap.isOpened():
         raise RuntimeError(f"Kunne ikke genåbne videoen: {VIDEO_PATH}")
+    frame_reader = FrameReader(cap, buffer_size=4)
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or frame0.shape[1]
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or frame0.shape[0]
@@ -1426,6 +1530,8 @@ def main():
 
     print("Loading YOLO...")
     model = YOLO("yolo11m.pt")
+    if torch.cuda.is_available():
+        model.to("cuda")
 
     tracker = sv.ByteTrack(
         track_activation_threshold=0.35,
@@ -1438,7 +1544,7 @@ def main():
     identity = IdentityManager(PLAYER_IDS, max_age_frames, MAX_MATCH_DIST_M)
     live_states: Dict[int, LiveState] = {}
 
-    pose_options = PoseLandmarkerOptions(
+    _pose_options = PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path="pose_landmarker_full.task"),
         running_mode=mp_vision.RunningMode.IMAGE,
         num_poses=1,
@@ -1447,8 +1553,9 @@ def main():
         min_tracking_confidence=0.5,
         output_segmentation_masks=False
     )
-
-    pose_landmarker = PoseLandmarker.create_from_options(pose_options)
+    POSE_POOL_SIZE = 4
+    pose_pool = [PoseLandmarker.create_from_options(_pose_options) for _ in range(POSE_POOL_SIZE)]
+    pose_executor = ThreadPoolExecutor(max_workers=POSE_POOL_SIZE)
 
     ensure_dir(SAVE_DIR)
     out_path = make_output_path(SAVE_DIR, VIDEO_PATH)
@@ -1480,13 +1587,13 @@ def main():
 
     try:
         while True:
-            ok, frame = cap.read()
+            ok, frame = frame_reader.read()
             if not ok or frame is None:
                 break
             frame_idx += 1
             timestamp_s = frame_idx / fps
 
-            results = model(frame, verbose=False, conf=CONF, iou=IOU, imgsz=IMGSZ)[0]
+            results = model(frame, verbose=False, conf=CONF, iou=IOU, imgsz=IMGSZ, half=torch.cuda.is_available())[0]
             detections = sv.Detections.from_ultralytics(results)
             annotated = frame.copy()
             det_rows: List[dict] = []
@@ -1510,7 +1617,38 @@ def main():
                     H_img, W_img = frame.shape[:2]
                     do_pose_this_frame = (frame_idx % POSE_EVERY_N_FRAMES == 0)
 
-                    for xyxy, track_id in zip(detections.xyxy, detections.tracker_id):
+                    def _run_pose(landmarker, pose_crop_small):
+                        mp_image = mp.Image(
+                            image_format=mp.ImageFormat.SRGB,
+                            data=cv2.cvtColor(pose_crop_small, cv2.COLOR_BGR2RGB)
+                        )
+                        pose_result = landmarker.detect(mp_image)
+                        if pose_result.pose_landmarks and len(pose_result.pose_landmarks) > 0:
+                            class FakeLandmarks:
+                                def __init__(self, landmarks):
+                                    self.landmark = landmarks
+                            class FakePoseResult:
+                                def __init__(self, landmarks):
+                                    self.pose_landmarks = FakeLandmarks(landmarks)
+                            return FakePoseResult(pose_result.pose_landmarks[0])
+                        return None
+
+                    pose_futures = []
+                    raw_detections = list(zip(detections.xyxy, detections.tracker_id))
+
+                    for det_i, (xyxy, track_id) in enumerate(raw_detections):
+                        x1, y1, x2, y2 = xyxy.astype(float)
+                        future = None
+                        if do_pose_this_frame:
+                            bx1, by1, bx2, by2 = expand_bbox(x1, y1, x2, y2, W_img, H_img, frac=POSE_BBOX_EXPAND)
+                            pose_crop = frame[by1:by2, bx1:bx2]
+                            if pose_crop.size > 0:
+                                pose_crop_small, _ = resize_keep_aspect(pose_crop, POSE_CROP_MAX_W, POSE_CROP_MAX_H)
+                                lm = pose_pool[det_i % POSE_POOL_SIZE]
+                                future = pose_executor.submit(_run_pose, lm, pose_crop_small.copy())
+                        pose_futures.append(future)
+
+                    for det_i, (xyxy, track_id) in enumerate(raw_detections):
                         x1, y1, x2, y2 = xyxy.astype(float)
                         foot_px_x = (x1 + x2) / 2.0
                         foot_px_y = y2
@@ -1529,36 +1667,11 @@ def main():
                         pose_feat = None
                         knee_L = knee_R = knee_avg = hip_drop = None
                         ready_flag = 0
-                        if do_pose_this_frame:
-                            bx1, by1, bx2, by2 = expand_bbox(x1, y1, x2, y2, W_img, H_img, frac=POSE_BBOX_EXPAND)
-                            pose_crop = frame[by1:by2, bx1:bx2]
-                            if pose_crop.size > 0:
-                                pose_crop_small, _ = resize_keep_aspect(pose_crop, POSE_CROP_MAX_W, POSE_CROP_MAX_H)
-                                
-                                # Ny MediaPipe Tasks API
-                                mp_image = mp.Image(
-                                    image_format=mp.ImageFormat.SRGB,
-                                    data=cv2.cvtColor(pose_crop_small, cv2.COLOR_BGR2RGB)
-                                )
-                                
-                                pose_result = pose_landmarker.detect(mp_image)
-                                
-                                # Tilpas til dit eksisterende kode (så du ikke skal ændre extract_pose_signature)
-                                if pose_result.pose_landmarks and len(pose_result.pose_landmarks) > 0:
-                                    class FakeLandmarks:
-                                        def __init__(self, landmarks):
-                                            self.landmark = landmarks
-
-                                    class FakePoseResult:
-                                        def __init__(self, landmarks):
-                                            self.pose_landmarks = FakeLandmarks(landmarks)
-
-                                    pose_res = FakePoseResult(pose_result.pose_landmarks[0])
-                                else:
-                                    pose_res = None
-
-                                pose_feat = extract_pose_signature(pose_res)
-                                knee_L, knee_R, knee_avg, hip_drop, ready_flag = compute_ready_from_pose(pose_res)
+                        future = pose_futures[det_i]
+                        if future is not None:
+                            pose_res = future.result()
+                            pose_feat = extract_pose_signature(pose_res)
+                            knee_L, knee_R, knee_avg, hip_drop, ready_flag = compute_ready_from_pose(pose_res)
 
                         temp_rows.append({
                             "frame_idx": frame_idx,
@@ -1655,11 +1768,15 @@ def main():
             if key in (27, ord("q"), ord("Q")):
                 break
     finally:
+        frame_reader.stop()
         cap.release()
         writer.release()
         csv_f.close()
         jsonl_f.close()
         cv2.destroyAllWindows()
+        pose_executor.shutdown(wait=False)
+        for lm in pose_pool:
+            lm.close()
 
     print(f"Saved video: {out_path}")
     print(f"Saved CSV:   {csv_path}")
