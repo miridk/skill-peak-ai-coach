@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}SkillPeak V3{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js" defer></script>
+{% block head %}{% endblock %}
+</head>
+<body>
+<nav class="topnav">
+  <a class="brand" href="/">⚡ SkillPeak V3</a>
+  <span class="nav-spacer"></span>
+  {% block nav %}{% endblock %}
+</nav>
+<main class="page-content">
+  {% block content %}{% endblock %}
+</main>
+<script>
+  // Global helpers available to all pages
+  window.SP = window.SP || {};
+  SP.fmtTime = t => {
+    if (t == null || isNaN(t)) return '—';
+    const m = Math.floor(t/60), s = Math.floor(t%60);
+    return m + ':' + String(s).padStart(2,'0');
+  };
+  SP.fmtMs = t => t == null || isNaN(t) ? '—' : Math.round(t*1000) + ' ms';
+  SP.PLAYER_COLOURS = {1:'#4fc3f7', 2:'#f06292', 3:'#aed581', 4:'#ffb74d'};
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

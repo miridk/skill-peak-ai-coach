@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}SkillPeak V3 — Sessions{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Sessions</h1>
+  <p class="subtitle">Select a session to view the coaching report and interactive dashboard.</p>
+</div>
+
+{% if sessions %}
+<div class="session-grid">
+  {% for s in sessions %}
+  <div class="card session-card">
+    <div class="session-title">{{ s.video_name }}</div>
+    <div class="session-meta">
+      {{ s.duration_min }} min
+      {% if s.has_video %}<span class="badge badge-green">Video</span>{% endif %}
+      {% if s.has_report %}<span class="badge badge-blue">Report</span>{% endif %}
+    </div>
+    <div class="session-id">{{ s.session_id }}</div>
+    <div class="session-actions">
+      <a class="btn" href="/session/{{ s.session_id }}">Dashboard</a>
+      {% if s.has_report %}
+      <a class="btn btn-outline" href="/session/{{ s.session_id }}/report" target="_blank">HTML Report</a>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+  <p>No sessions found. Run the pipeline to generate a session:</p>
+  <pre>python V3/run_pipeline.py --video path/to/video.mp4</pre>
+</div>
+{% endif %}
+{% endblock %}

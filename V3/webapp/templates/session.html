@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}Session {{ session_id }} — SkillPeak V3{% endblock %}
+
+{% block nav %}
+<a class="nav-link" href="/">← Sessions</a>
+{% endblock %}
+
+{% block head %}
+<script>
+  const SESSION_ID = {{ session_id | tojson }};
+  const META = {{ meta | tojson }};
+</script>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>{{ meta.get('video_name', session_id) }}</h1>
+  <p class="subtitle">
+    Session {{ session_id }} &nbsp;|&nbsp;
+    <span id="duration-label">loading…</span>
+  </p>
+</div>
+
+<!-- Player tabs -->
+<div class="tabs" id="player-tabs">
+  <button class="tab active" data-pid="0">Overview</button>
+  <button class="tab" data-pid="1" style="color:#4fc3f7">Player 1</button>
+  <button class="tab" data-pid="2" style="color:#f06292">Player 2</button>
+  <button class="tab" data-pid="3" style="color:#aed581">Player 3</button>
+  <button class="tab" data-pid="4" style="color:#ffb74d">Player 4</button>
+</div>
+
+<!-- Overview panel -->
+<div id="panel-0" class="tab-panel active">
+  <div class="grid-2">
+    <div class="card">
+      <h3>Speed Timeline</h3>
+      <div class="chart-wrap"><canvas id="speedChart"></canvas></div>
+    </div>
+    <div class="card">
+      <h3>Court Minimap</h3>
+      <canvas id="minimap" width="240" height="480" style="display:block;margin:0 auto;background:#1e1e1e;border-radius:6px"></canvas>
+    </div>
+  </div>
+  <div class="card" style="margin-top:14px">
+    <h3>Team Insights</h3>
+    <ul class="bullets" id="global-insights"></ul>
+  </div>
+  <div class="card" style="margin-top:14px">
+    <h3>Shot Type Distribution</h3>
+    <div class="chart-wrap"><canvas id="shotChart"></canvas></div>
+  </div>
+</div>
+
+<!-- Per-player panels (1-4) -->
+{% for pid in [1,2,3,4] %}
+<div id="panel-{{ pid }}" class="tab-panel" style="display:none">
+  <div class="grid-2">
+    <div class="card">
+      <h3>Heatmap</h3>
+      <img id="heatmap-{{ pid }}" src="/api/session/{{ session_id }}/heatmap/{{ pid }}"
+           alt="Heatmap Player {{ pid }}"
+           style="display:block;margin:0 auto;max-width:220px;border-radius:6px"
+           onerror="this.style.display='none'">
+    </div>
+    <div class="card">
+      <h3>Shot Radar</h3>
+      <canvas id="radar-{{ pid }}" width="300" height="300" style="display:block;margin:0 auto"></canvas>
+    </div>
+  </div>
+  <div class="card" style="margin-top:14px">
+    <h3>Player {{ pid }} Insights</h3>
+    <ul class="bullets" id="insights-{{ pid }}"></ul>
+  </div>
+</div>
+{% endfor %}
+
+<!-- Video panel (bottom) -->
+<div class="card" style="margin-top:14px" id="video-card">
+  <h3>Annotated Video</h3>
+  <video id="session-video" controls preload="metadata" style="width:100%;border-radius:6px;background:#000">
+    <source src="/media/{{ session_id }}/annotated.mp4" type="video/mp4">
+    Video not available.
+  </video>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/heatmap.js') }}"></script>
+<script src="{{ url_for('static', filename='js/charts.js') }}"></script>
+<script src="{{ url_for('static', filename='js/player.js') }}"></script>
+<script>
+(async function() {
+  // Load meta
+  document.getElementById("duration-label").textContent =
+    META.total_frames
+      ? (META.total_frames / Math.max(META.fps||30,1) / 60).toFixed(1) + ' min'
+      : 'duration unknown';
+
+  // Tab switching
+  document.getElementById("player-tabs").addEventListener("click", e => {
+    const btn = e.target.closest(".tab");
+    if (!btn) return;
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach(p => p.style.display = "none");
+    btn.classList.add("active");
+    document.getElementById("panel-" + btn.dataset.pid).style.display = "";
+  });
+
+  // Load comparison data
+  const [compRes, eventsRes] = await Promise.all([
+    fetch(`/api/session/${SESSION_ID}/comparison`).then(r => r.json()).catch(()=>null),
+    fetch(`/api/session/${SESSION_ID}/events`).then(r => r.json()).catch(()=>[]),
+  ]);
+
+  if (compRes) {
+    SP.buildSpeedChart("speedChart", SESSION_ID);
+    SP.buildShotChart("shotChart", compRes.summaries);
+    SP.buildRadarCharts(compRes.summaries);
+    SP.renderInsights(compRes.insights);
+  }
+
+  SP.initMinimap("minimap", SESSION_ID);
+  SP.initVideoEvents("session-video", eventsRes);
+})();
+</script>
+{% endblock %}

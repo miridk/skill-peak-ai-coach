@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}Player {{ pid }} — {{ session_id }} — SkillPeak V3{% endblock %}
+
+{% block nav %}
+<a class="nav-link" href="/session/{{ session_id }}">← Session</a>
+{% endblock %}
+
+{% block head %}
+<script>
+  const SESSION_ID = {{ session_id | tojson }};
+  const PID = {{ pid }};
+</script>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1 style="color:{{ ['','#4fc3f7','#f06292','#aed581','#ffb74d'][pid] }}">Player {{ pid }}</h1>
+  <p class="subtitle">Session {{ session_id }}</p>
+</div>
+
+<div class="grid-2">
+  <div class="card">
+    <h3>Position Heatmap</h3>
+    <img src="/api/session/{{ session_id }}/heatmap/{{ pid }}"
+         alt="Heatmap" style="display:block;margin:0 auto;max-width:280px;border-radius:6px"
+         onerror="this.style.display='none'">
+  </div>
+  <div class="card">
+    <h3>Shot Radar</h3>
+    <canvas id="radar" width="300" height="300" style="display:block;margin:0 auto"></canvas>
+  </div>
+</div>
+
+<div class="card" style="margin-top:14px">
+  <h3>Speed & Reaction Timeline</h3>
+  <div class="chart-wrap"><canvas id="speedChart"></canvas></div>
+</div>
+
+<div class="card" style="margin-top:14px">
+  <h3>Summary Stats</h3>
+  <table id="stats-table" class="stats-table">
+    <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+    <tbody id="stats-body"></tbody>
+  </table>
+</div>
+
+<div class="card" style="margin-top:14px">
+  <h3>Coaching Insights</h3>
+  <ul class="bullets" id="insights-list"></ul>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/charts.js') }}"></script>
+<script>
+(async function() {
+  const compRes = await fetch(`/api/session/${SESSION_ID}/comparison`)
+    .then(r => r.json()).catch(()=>null);
+  if (!compRes) return;
+
+  const ps = compRes.summaries[PID] || {};
+
+  // Stats table
+  const tbody = document.getElementById("stats-body");
+  const rows = [
+    ["Total Distance (m)",   (ps.total_distance_m||0).toFixed(0)],
+    ["Mean Speed (km/h)",    ps.mean_speed_mps != null ? (ps.mean_speed_mps*3.6).toFixed(1) : "—"],
+    ["Max Speed (km/h)",     ps.max_speed_mps  != null ? (ps.max_speed_mps*3.6).toFixed(1)  : "—"],
+    ["Ready Time (%)",       ps.ready_time_pct  != null ? ps.ready_time_pct.toFixed(1)  : "—"],
+    ["Knee Angle Mean°",     ps.knee_angle_mean_deg != null ? ps.knee_angle_mean_deg.toFixed(0) : "—"],
+    ["Reaction Time (ms)",   ps.mean_reaction_time_s != null ? (ps.mean_reaction_time_s*1000).toFixed(0) : "—"],
+    ["Reaction Events",      ps.reaction_events ?? "—"],
+    ["Shots Total",          ps.shots_total ?? "—"],
+    ["Elbow Angle (R)°",     ps.mean_elbow_angle_R != null ? ps.mean_elbow_angle_R.toFixed(0) : "—"],
+    ["Hip Rotation°",        ps.mean_hip_rotation != null ? ps.mean_hip_rotation.toFixed(0) : "—"],
+    ["Team Spread (m)",      ps.mean_team_spread_m != null ? ps.mean_team_spread_m.toFixed(1) : "—"],
+    ["Role Profile",         ps.role_profile || "—"],
+    ["Top Zone",             ps.top_zone || "—"],
+    ["Court Crossings",      ps.crossing_events_count ?? "—"],
+  ];
+  rows.forEach(([k,v]) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${k}</td><td>${v}</td>`;
+    tbody.appendChild(tr);
+  });
+
+  // Insights
+  const ul = document.getElementById("insights-list");
+  const playerInsights = (compRes.insights||[]).filter(i => i.player_id === PID || i.player_id === 0);
+  if (playerInsights.length === 0) {
+    ul.innerHTML = "<li>No specific insights generated.</li>";
+  } else {
+    const sev = {positive:"#69f0ae", warning:"#ff8a65", info:"#90caf9"};
+    const ico = {positive:"✓", warning:"⚠", info:"ℹ"};
+    playerInsights.forEach(ins => {
+      const li = document.createElement("li");
+      const c = sev[ins.severity]||"#90caf9";
+      li.style.cssText = `border-left:3px solid ${c};padding-left:8px;margin:4px 0`;
+      li.textContent = (ico[ins.severity]||"•") + " " + ins.text;
+      ul.appendChild(li);
+    });
+  }
+
+  // Shot radar
+  SP.buildSingleRadar("radar", PID, ps.shot_type_breakdown || {});
+
+  // Speed chart (single player)
+  SP.buildSpeedChart("speedChart", SESSION_ID, PID);
+})();
+</script>
+{% endblock %}
