@@ -55,7 +55,7 @@ class CourtPositioningAnalyzer:
         for pid in C.PLAYER_IDS:
             if pid not in pivot_y.columns:
                 continue
-            y_series = pivot_y[pid].fillna(method="ffill").fillna(method="bfill")
+            y_series = pivot_y[pid].ffill().bfill()
             rolling  = y_series.rolling(_CROSSING_ROLLING_FRAMES, center=True, min_periods=3).median()
             side_prev = (rolling < mid).astype(int)
             side_prev_shifted = side_prev.shift(1).fillna(side_prev)

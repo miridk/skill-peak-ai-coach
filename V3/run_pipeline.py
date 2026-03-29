@@ -47,6 +47,7 @@ def run_pipeline(
     skip_pass1: bool = False,
     skip_pass2: bool = False,
     existing_session_dir: str | None = None,
+    recalib: bool = False,
 ) -> str:
     """
     Full V3 pipeline. Returns path to the outputs directory.
@@ -56,13 +57,21 @@ def run_pipeline(
     # ── resolve calibration ──────────────────────────────────────────────────
     if calib_path is None:
         calib_path = _find_latest_calib()
-    if calib_path and os.path.isfile(calib_path):
-        _, H = load_calibration(calib_path)
-        print(f"V3 — calibration loaded: {calib_path}")
-    else:
-        print("V3 — no calibration found, user must click court corners.")
+
+    force_click = recalib or not (calib_path and os.path.isfile(calib_path))
+
+    if not force_click:
+        result = load_calibration(calib_path)
+        if result is None:
+            force_click = True
+        else:
+            _, H = result
+            print(f"V3 — calibration loaded: {calib_path}")
+
+    if force_click:
         import cv2
-        from shared.calibration import COURT_DST
+        from shared.calibration import COURT_DST, save_calibration
+        print("V3 — click 4 court corners (TL, TR, BR, BL) in the video frame.")
         cap = cv2.VideoCapture(video_path)
         ok, frame = cap.read()
         cap.release()
@@ -72,6 +81,15 @@ def run_pipeline(
         src = np.array(corners, dtype=np.float32)
         dst = np.array(COURT_DST, dtype=np.float32)
         H, _ = cv2.findHomography(src, dst)
+        if H is None:
+            raise RuntimeError("Homography failed — corners may be collinear.")
+        # Save with a new timestamp-stamped name so original is preserved
+        new_calib_name = f"v3_{now_stamp()}"
+        calib_dir = os.path.join(os.path.dirname(ROOT), "calibration")
+        ensure_dir(calib_dir)
+        calib_path = os.path.join(calib_dir, f"{new_calib_name}.json")
+        save_calibration(calib_path, new_calib_name, corners, H)
+        print(f"V3 — new calibration saved: {calib_path}")
 
 
     # ── output paths ──────────────────────────────────────────────────────────
@@ -98,11 +116,13 @@ def run_pipeline(
         print("V3 ─── Pass 1: skeleton extraction ───────────────────────────")
         from tracking.tracker import SkeletonTracker
         tracker = SkeletonTracker()
-        session_meta = tracker.run(
+        tracker.run(
             video_path=video_path,
             calib_path=calib_path,
             output_dir=out_dir,
         )
+        with open(meta_path) as f:
+            session_meta = json.load(f)
     else:
         raise RuntimeError("skip_pass1 set but no existing skeleton.parquet found.")
 
@@ -281,6 +301,8 @@ def main():
                         help="Skip skeleton extraction (skeleton.parquet must exist)")
     parser.add_argument("--skip-pass2", action="store_true",
                         help="Skip shuttle detection (shuttle.parquet must exist)")
+    parser.add_argument("--recalib", action="store_true",
+                        help="Force re-clicking of court corners even if a calibration JSON exists")
     args = parser.parse_args()
 
     if args.session:
@@ -317,6 +339,7 @@ def main():
             serve=args.serve,
             skip_pass1=args.skip_pass1,
             skip_pass2=args.skip_pass2,
+            recalib=args.recalib,
         )
     else:
         # Interactive: open file dialog
