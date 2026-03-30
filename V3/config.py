@@ -13,7 +13,7 @@ SAVE_FPS_FALLBACK = 30.0
 YOLO_MODEL_PATH   = "../V2/yolo11m.pt"
 POSE_MODEL_PATH   = "../V2/pose_landmarker_full.task"
 CALIB_DIR         = "../V2/calibration"
-CALIB_SETUP_NAME  = "almind_viuf_hallen_baseline2"
+CALIB_SETUP_NAME  = ""
 
 # ── YOLO detection ────────────────────────────────────────────────────────────
 CONF   = 0.45
@@ -23,8 +23,8 @@ IMGSZ  = 1088
 # ── court geometry ────────────────────────────────────────────────────────────
 COURT_W = 6.10
 COURT_L = 13.40
-COURT_MARGIN_PX       = 85
-SIDE_BOTTOM_MARGIN_PX = 2
+COURT_MARGIN_PX       = 85   # far baseline (top of image) — players rarely go here
+SIDE_BOTTOM_MARGIN_PX = 140  # sides + near baseline — players chase shuttles here
 
 # ── player IDs ────────────────────────────────────────────────────────────────
 PLAYER_IDS  = [1, 2, 3, 4]
@@ -36,7 +36,7 @@ CLIP_PRETRAINED = "laion2b_s34b_b79k"
 CLIP_DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ── identity manager ──────────────────────────────────────────────────────────
-MAX_AGE_SECONDS   = 3.0
+MAX_AGE_SECONDS   = 6.0   # keep identity memory alive longer during out-of-court retrieval
 MAX_MATCH_DIST_M  = 3.2
 
 W_CLIP      = 0.34

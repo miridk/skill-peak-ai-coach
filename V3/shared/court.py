@@ -89,8 +89,13 @@ def point_in_court_asymmetric_margin(
     poly = court_pts.reshape(-1, 2).astype(np.float32)
     if cv2.pointPolygonTest(court_pts, (x, y), False) >= 0:
         return True
+    # signed_dist is negative when outside; >= -margin means within margin px of boundary
     signed_dist = float(cv2.pointPolygonTest(court_pts, (x, y), True))
     top_y_min = min(float(p[1]) for p in poly)
+    # Above the far baseline (small y in pixels): use top_margin
+    if y < top_y_min and signed_dist >= -top_margin:
+        return True
+    # Sides and near baseline: use side_bottom_margin (players chase shuttles here)
     if y >= top_y_min and signed_dist >= -side_bottom_margin:
         return True
     return False
